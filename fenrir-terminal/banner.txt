@@ -1,0 +1,4 @@
+🐺  ФЕНРИР ТЕРМИНАЛ  —  Fenrir Terminal
+   Личный терминал Фенрира. Shadow — хозяин, Фенрир — оператор.
+   Оркестра: Fenrir-Orchestra (~/workspace/fenrir-orchestra)
+   Lix: приоритет №1 до 09.11.2026 • 260 RPM • 2M TPM • 6 параллельных

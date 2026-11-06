@@ -1,0 +1,15 @@
+# Фенрир Терминал — подключается из ~/.bashrc
+export FENRIR_TERMINAL=1
+export FENRIR_HOME="$HOME/workspace"
+export PATH="$HOME/workspace/fenrir-terminal/bin:$PATH"
+# Промпт: 🐺 fenrir@terminal ~/... $
+PS1='\[\033[1;92m\]🐺 fenrir@terminal\[\033[0m\] \[\033[1;34m\]\w\[\033[0m\] \$ '
+# Алиасы
+alias fo='python3 ~/workspace/fenrir-orchestra/fenrir_orchestra.py'
+alias fprobe='python3 ~/workspace/fenrir-orchestra/fenrir_orchestra.py probe'
+alias fstatus='python3 ~/workspace/fenrir-orchestra/fenrir_orchestra.py status'
+alias fram='free -h; ps aux --sort=-%mem | head -n 6'
+# Баннер при интерактивном входе
+if [ -f "$HOME/workspace/fenrir-terminal/banner.txt" ]; then
+  cat "$HOME/workspace/fenrir-terminal/banner.txt"
+fi

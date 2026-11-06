@@ -1,0 +1,110 @@
+{
+  "_note": "Только маршруты. НИКАКИХ ключей/токенов — они живут в коннекторах custom.lix / custom.klinch / custom.anymodel / custom.anymodel2 и подставляются суррогатом в рантайме.",
+  "defaults": {
+    "chat_timeout_s": 300,
+    "cooldown_minutes": 30,
+    "max_tokens": 2000,
+    "models_timeout_s": 30,
+    "serve_host": "127.0.0.1",
+    "serve_port": 4097,
+    "max_parallel": 6,
+    "rpm_limit": 260,
+    "tpm_limit": 2000000
+  },
+  "lix": {
+    "dead_403_2026_11_06_0354": [
+      "claude-opus-5.5",
+      "claude-sonnet-5.5",
+      "gpt-6-astra"
+    ],
+    "dead_note": "Мёртвые (403) — НЕ хоронить навсегда: перепроверять в каждом probe ротацией (один короткий вызов на провайдера, без лишних токенов). Могут ожить.",
+    "deadline": "2026-11-09T01:21:00+04:00",
+    "deadline_note": "Ключ Lix на 3 дня безлимита, дедлайн — понедельник 09.11.2026 ~01:20. Уточнение Shadow 06.11 14:21: осталось 2д 11ч — на ~22ч раньше, чем считалось (23:59). Выжать максимум: Lix — строгий приоритет №1 во всех ролях, тяжёлые задачи в первую очередь.",
+    "live_2026_11_06_0400": [
+      "deepseek-v4.1-flash",
+      "deepseek-v4-pro",
+      "glm-5.3-prime",
+      "kimi-k3",
+      "qwen3.8-max",
+      "qwen-flash"
+    ],
+    "priority": 1,
+    "priority_rule": "ТОЛЬКО Lix. Klinch и Anymodel НЕ использовать — приказ Shadow 06.11.2026 ~11:30.",
+    "tariff": {
+      "provider": "lix",
+      "plan": "безлимит на весь оплаченный период до 09.11.2026",
+      "rpm": 260,
+      "tpm": 2000000,
+      "max_parallel": 6,
+      "total_volume": "не ограничен",
+      "checked": "2026-11-06 ~04:14, чек Shadow",
+      "rule": "6 параллельных воркеров максимум, очередь batch без пауз; одиночные последовательные вызовы используют <1% лимита"
+    }
+  },
+  "providers": {
+    "anymodel": {
+      "allowed_hosts": [
+        "anymodel.ghostly.su"
+      ],
+      "base_url": "https://anymodel.ghostly.su/v1",
+      "connector": "custom.anymodel",
+      "name": "anymodel",
+      "notes": "НЕ ИСПОЛЬЗОВАТЬ — приказ Shadow 06.11.2026 ~11:30 (только Lix)."
+    },
+    "anymodel2": {
+      "allowed_hosts": [
+        "anymodel.ghostly.su"
+      ],
+      "base_url": "https://anymodel.ghostly.su/v1",
+      "connector": "custom.anymodel2",
+      "name": "anymodel2",
+      "notes": "НЕ ИСПОЛЬЗОВАТЬ — приказ Shadow 06.11.2026 ~11:30 (только Lix)."
+    },
+    "klinch": {
+      "allowed_hosts": [
+        "api.klinch.cloud"
+      ],
+      "base_url": "https://api.klinch.cloud/v1",
+      "connector": "custom.klinch",
+      "name": "klinch",
+      "notes": "НЕ ИСПОЛЬЗОВАТЬ — приказ Shadow 06.11.2026 ~11:30 (только Lix)."
+    },
+    "lix": {
+      "allowed_hosts": [
+        "lix.autos"
+      ],
+      "base_url": "https://lix.autos/v1",
+      "connector": "custom.lix",
+      "name": "lix",
+      "notes": "ПРИОРИТЕТ №1 до дедлайна 09.11.2026. Живы 06.11 ~04:00: deepseek-v4.1-flash, deepseek-v4-pro, glm-5.3-prime, kimi-k3, qwen3.8-max, qwen-flash. Мёртвы (403): claude-opus-5.5, claude-sonnet-5.5, gpt-6-astra — перепроверять ротацией в probe."
+    }
+  },
+  "roles": {
+    "code": [
+      "lix/deepseek-v4.1-flash",
+      "lix/kimi-k3",
+      "lix/qwen3.8-max",
+      "lix/deepseek-v4-pro"
+    ],
+    "review": [
+      "lix/glm-5.3-prime",
+      "lix/deepseek-v4-pro",
+      "lix/kimi-k3"
+    ],
+    "text": [
+      "lix/qwen-flash",
+      "lix/kimi-k3",
+      "lix/deepseek-v4.1-flash"
+    ]
+  },
+  "tariff_lix": {
+    "provider": "lix",
+    "plan": "безлимит на весь оплаченный период до 09.11.2026",
+    "rpm": 260,
+    "tpm": 2000000,
+    "max_parallel": 6,
+    "total_volume": "не ограничен",
+    "checked": "2026-11-06 ~04:14, чек Shadow",
+    "rule": "6 параллельных воркеров максимум, очередь batch без пауз; одиночные последовательные вызовы используют <1% лимита"
+  }
+}
