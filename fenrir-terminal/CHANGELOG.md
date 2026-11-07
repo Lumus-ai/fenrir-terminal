@@ -1,5 +1,36 @@
 # Fenrir Terminal — Changelog
 
+## v2.1-шаг-1 (роутер и экономика: выбор модели, прайс, учёт, алерты) — 07.11.2026
+
+- Роутер `fenrir-orchestra/fenrir_router.py` (stdlib only, только Lix):
+  живой прайс `state/prices.json` (каталог через GET /v1/models, цены 0 —
+  Lix безлимит 0x до 09.11.2026, деньги не считаются; атомарная запись +
+  .bak + .last_valid), выбор модели под роль с учётом cooldown и мёртвых,
+  учёт токенов за день по runs/summary.json, мягкий дневной бюджет-сторож
+  (10 млн токенов, предупреждение в WORK_LOG при 80%), алерт при смерти
+  ключа (маркер state/router-alert + строка в WORK_LOG).
+- Мёртвая тройка (claude-opus-5.5, claude-sonnet-5.5, gpt-6-astra — 403,
+  вне каталога) никогда не предлагается. qwen-flash ЖИВ (прямая проверка
+  07.11 ~16:25, проба 1,1 с) — кандидат для роли text, в цепочках
+  providers.json его нет, роутер добавляет сам.
+- Встройка в `chain_for_role` (fenrir_orchestra.py): цепочка пропускает
+  мёртвые модели роутера (prices.json, иначе жёсткая тройка) вдобавок
+  к cooldown; порядок цепочек не менялся.
+- CLI: `fenrir router pick --role code|review|text`, `fenrir router status
+  [--probe]`, `fenrir router probe`, `fenrir router refresh`.
+- Найдено и исправлено по ходу живых проб: пустой ответ с
+  finish_reason=length при капе 20 токенов — живая модель, упёршаяся
+  в кап (артефакт, задокументирован 06.11), а не смерть; роутер считает
+  такую пробу OK. Провал пробы cooldown НЕ ставит (нет каскада).
+- Проверки живьём 07.11.2026: `test_router.py` — 39 проверок (выбор по
+  ролям, пропуск cooldown/мёртвых, прайс, учёт, бюджет, алерт, встройка
+  в chain_for_role, length=alive); остальные suites зелёные (321
+  проверка). Живой refresh: 25 моделей в каталоге; живая проба: 4/4 OK
+  (deepseek-v4.1-flash, glm-5.3-prime, kimi-k3, qwen-flash); pick code —
+  deepseek-v4.1-flash, text — kimi-k3, review — glm-5.3-prime; токены
+  сегодня 1 139 003 (11% бюджета), алерта нет. state/prices.json —
+  генерируемое состояние, в GitHub не пушится.
+
 ## v2.2-шаг-2 (FunPay: очередь отправки + выполнение простых заказов) — 07.11.2026
 
 - Очередь отправки `~/workspace/funpay-shop/outbox.json`

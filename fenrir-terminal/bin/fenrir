@@ -16,6 +16,11 @@
 #   fenrir funpay enqueue <draft-id> — черновик в очередь (фишинг/агрессия — нет)
 #   fenrir funpay fulfill [--inbox PATH] [--order ID] [--dry-run] — выполнение
 #     простых текстовых заказов через агента (Lix), сдача — в очередь
+#   fenrir router pick --role code|review|text [--refresh] — выбор живой модели Lix
+#   fenrir router status [--probe] — health, токены за день, бюджет, алерт
+#   fenrir router probe | fenrir router refresh — health-проба / живой прайс
+# Роутер v2.1 шаг 1 — fenrir_router.py в оркестре (только Lix; мёртвая тройка
+# 403 никогда не предлагается; qwen-flash жив и кандидат для text).
 # Планировщик v1.4 — fenrir_scheduler.py (ядро: tasks.yaml + runner).
 # Утренний дайджест v1.4 — fenrir_digest.py.
 # Бэкап v1.4 — fenrir_backup.py (tar.gz + Google Drive).
@@ -93,10 +98,14 @@ case "${1:-status}" in
     shift
     python3 "$TERM_DIR/fenrir_funpay.py" "$@"
     ;;
+  router)
+    shift
+    python3 "$ORCH/fenrir_router.py" "$@"
+    ;;
   down)
     pkill -f "fenrir_orchestra.py serv[e]" && echo "fenrir-orchestra остановлена" || echo "serve не работала"
     ;;
   *)
-    echo "fenrir: status | ram | health | watchdog | orchestra | probe | up | down | doctor | limits | usage | agent | task | scheduler | morning | backup"
+    echo "fenrir: status | ram | health | watchdog | orchestra | probe | up | down | doctor | limits | usage | agent | task | scheduler | morning | backup | router"
     ;;
 esac

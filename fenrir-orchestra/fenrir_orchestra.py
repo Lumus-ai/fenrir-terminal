@@ -208,11 +208,30 @@ def list_models(provider):
     return True, ids, ""
 
 
+def _router_dead():
+    """Мёртвые модели по роутеру v2.1 (state/prices.json, enabled=false).
+    Без файла — жёсткая тройка 403. Никогда не роняет движок: любая
+    ошибка чтения -> тройка. qwen-flash здесь НЕТ — он жив (07.11 ~16:25)."""
+    dead = {"claude-opus-5.5", "claude-sonnet-5.5", "gpt-6-astra"}
+    try:
+        with open(os.path.join(STATE_DIR, "prices.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        found = {m["id"] for m in data.get("models", [])
+                 if isinstance(m, dict) and m.get("enabled") is False}
+        return found or dead
+    except (OSError, ValueError, AttributeError):
+        return dead
+
+
 def chain_for_role(cfg, role):
-    """Фолбэк-цепочка (provider_name, model) для роли, без cooldown."""
+    """Фолбэк-цепочка (provider_name, model): без cooldown и без мёртвых
+    по роутеру v2.1 (prices.json, иначе жёсткая тройка 403)."""
+    dead = _router_dead()
     out = []
     for spec in cfg["roles"].get(role, cfg["roles"]["text"]):
         pname, model = spec.split("/", 1)
+        if model in dead:
+            continue
         if not is_cooldown(f"{pname}/{model}"):
             out.append((pname, model))
     return out
