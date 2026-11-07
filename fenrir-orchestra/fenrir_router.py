@@ -29,7 +29,15 @@
     python3 fenrir_router.py status [--probe]
     python3 fenrir_router.py probe
     python3 fenrir_router.py refresh
+    python3 fenrir_router.py weekly [--date YYYY-MM-DD]
 Через терминал: fenrir router pick --role code | fenrir router status
+    | fenrir router weekly
+
+Шаг 2: еженедельный отчёт (reports/weekly-YYYY-Www.md: токены по дням
+и моделям, топ-3, инциденты из meta.json, стоимость 0 при Lix 0x)
+и фолбэк при бюджете: при warn/over pick берёт самую дешёвую живую
+модель роли (цена, затем латентность), маркер state/router-budget,
+снимается при сбросе дня или возврате бюджета в ok.
 """
 import argparse
 import json
@@ -54,6 +62,8 @@ PRICES_PATH = os.path.join(STATE_DIR, "prices.json")
 PRICES_BAK = PRICES_PATH + ".bak"
 PRICES_LAST_VALID = PRICES_PATH + ".last_valid"
 ALERT_PATH = os.path.join(STATE_DIR, "router-alert")
+BUDGET_MARKER = os.path.join(STATE_DIR, "router-budget")
+REPORTS_DIR = os.path.join(BASE, "reports")
 WORKLOG_PATH = os.path.join(BASE, "WORK_LOG.md")
 
 # Мёртвая тройка: HTTP 403 даже на «1+1=», отсутствует в каталоге
@@ -68,7 +78,8 @@ PROBE_MAX_TOKENS = 20
 HEALTH_TTL_S = 30 * 60  # провал пробы подавляет модель в pick на 30 мин
 DAILY_TOKENS_SOFT = 10_000_000  # мягкий дневной бюджет-сторож
 WARN_AT = 0.8  # предупреждение при 80% бюджета
-PRICES_VERSION = "2.1-step1"
+PRICES_VERSION = "2.1-step2"
+MAX_META_READS_WEEKLY = 500  # кап чтения meta.json при сборе инцидентов
 
 
 # ---------------------------------------------------------------- utils
@@ -300,14 +311,118 @@ def candidates_for_role(role):
     return chain
 
 
+def cheapest_live_for_role(role, prices=None, cooldown=None, now=None):
+    """Самая дешёвая живая модель роли: сортировка по (цена, латентность,
+    порядок цепочки). Цены сейчас все 0 (Lix 0x) — решает латентность
+    из probes, при её отсутствии — порядок цепочки. Живая = не в
+    cooldown, не мёртвая, без свежего провала пробы."""
+    chain = candidates_for_role(role)
+    cd = cooldown if cooldown is not None else orch.load_cooldown()
+    dead = dead_models(prices)
+    data = prices if prices is not None else load_prices()
+    by_id = {}
+    if data is not None:
+        by_id = {m["id"]: m for m in data.get("models", [])
+                 if isinstance(m, dict)}
+    now = now or time.time()
+    scored = []
+    for idx, spec in enumerate(chain):
+        pname, model = spec.split("/", 1)
+        if f"{pname}/{model}" in cd:
+            continue
+        if model in dead:
+            continue
+        if probe_failed_recently(model, data, now):
+            continue
+        entry = by_id.get(model, {})
+        price = (entry.get("input_per_1m") or 0) + (entry.get("output_per_1m") or 0)
+        lat = entry.get("latency_s")
+        scored.append(((price, lat if isinstance(lat, (int, float)) else float("inf"),
+                        idx), (pname, model)))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    return scored[0][1]
+
+
+def budget_marker_state():
+    """Текущий маркер фолбэка по бюджету (state/router-budget) или None."""
+    if not os.path.isfile(BUDGET_MARKER):
+        return None
+    try:
+        with open(BUDGET_MARKER, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return {"date": None, "status": "unreadable"}
+
+
+def sync_budget_marker(budget, role=None, model=None):
+    """Маркер фолбэка: ставится при warn/over, снимается при ok или
+    наступлении нового дня. Строка в WORK_LOG — один раз на
+    (день, статус) при установке и один раз при снятии."""
+    today = budget.get("date") or _today_samara()
+    current = budget_marker_state()
+    # Протухший маркер (другой день) — снять, затем обработать сегодня.
+    if current is not None and current.get("date") not in (None, today):
+        try:
+            os.remove(BUDGET_MARKER)
+        except OSError:
+            pass
+        _log_event("router", "бюджет-фолбэк снят", "ok",
+                   f"новый день {today}, старый маркер {current.get('date')}")
+        current = None
+    status = budget["status"]
+    if status == "ok":
+        if current is not None:
+            try:
+                os.remove(BUDGET_MARKER)
+            except OSError:
+                pass
+            _log_event("router", "бюджет-фолбэк снят", "ok",
+                       f"бюджет дня {today}: {budget['tokens']}/{budget['limit']} "
+                       f"({budget['ratio']:.0%})")
+        return None
+    if status in ("warn", "over"):
+        new = {"date": today, "status": status, "ratio": budget["ratio"],
+               "tokens": budget["tokens"], "limit": budget["limit"],
+               "role": role, "model": model,
+               "at": _now_samara().isoformat(timespec="seconds")}
+        if (current and current.get("date") == today
+                and current.get("status") == status
+                and current.get("model") == model):
+            return current
+        try:
+            orch.atomic_write(BUDGET_MARKER, json.dumps(new, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        _log_event("router", "бюджет-фолбэк включён", status,
+                   f"{budget['tokens']}/{budget['limit']} токенов "
+                   f"({budget['ratio']:.0%}), роль {role} -> {model}")
+        return new
+    return current
+
+
 def pick(role):
     """Первая живая модель роли: не в cooldown, не мёртвая, без свежего
-    провала пробы. Если все отфильтрованы — первая не-мёртвая (best effort)."""
+    провала пробы. Если все отфильтрованы — первая не-мёртвая (best effort).
+    Шаг 2: при warn/over дневного бюджета — самая дешёвая живая модель
+    роли (фолбэк), маркер state/router-budget."""
     chain = candidates_for_role(role)
     cd = orch.load_cooldown()
     dead = dead_models()
     prices = load_prices()
     now = time.time()
+    budget = budget_check()
+    if budget["status"] in ("warn", "over"):
+        got = cheapest_live_for_role(role, prices, cd, now)
+        if got is not None:
+            sync_budget_marker(budget, role, got[1])
+            return got, (f"budget-fallback: {budget['ratio']:.0%} дневного "
+                         f"бюджета ({budget['tokens']}/{budget['limit']})")
+        sync_budget_marker(budget, role, None)
+    else:
+        sync_budget_marker(budget)
     for spec in chain:
         pname, model = spec.split("/", 1)
         if f"{pname}/{model}" in cd:
@@ -444,6 +559,255 @@ def alert_state():
         return {"at": None, "reason": "маркер не читается"}
 
 
+# ---------------------------------------------------------------- weekly report
+def _samara_date(iso):
+    """Дата (Самара) из finished_at (UTC ISO) или None при битом значении.
+    Шаг 1 today_tokens() сравнивает префикс UTC-строки с самарской датой —
+    здесь честная конвертация: прогон в 00:00–04:00 по Самаре относится
+    к самарскому, а не к UTC-дню."""
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(SAMARA).date()
+
+
+def _classify_error(err):
+    """Класс инцидента по строке ошибки из meta.json attempts."""
+    e = str(err or "")
+    if "HTTP 429" in e:
+        return "HTTP 429 (параллельный лимит)"
+    if "HTTP 403" in e:
+        return "HTTP 403 (мёртвая модель)"
+    if "HTTP 502" in e:
+        return "HTTP 502"
+    if "HTTP 524" in e:
+        return "HTTP 524 (таймаут провайдера)"
+    if "finish_reason=length" in e:
+        return "пустой ответ (length, кап токенов)"
+    if "empty content" in e:
+        return "пустой ответ (другое)"
+    if e.strip():
+        return "прочее: " + e[:60]
+    return "без ошибки"
+
+
+def collect_week(end_date=None):
+    """Агрегация runs/*/summary.json за 7 дней до end_date включительно
+    (даты — Самара). Возвращает dict с итогами по дням/моделям,
+    инцидентами и латентностью. Денег нет: Lix 0x, cost всегда 0."""
+    if end_date is None:
+        end = _now_samara().date()
+    elif isinstance(end_date, str):
+        end = datetime.fromisoformat(end_date).date()
+    else:
+        end = end_date
+    days = [(end - timedelta(days=i)) for i in range(6, -1, -1)]
+    day_keys = [d.isoformat() for d in days]
+    per_day = {k: {"runs": 0, "tasks": 0, "ok": 0, "failed": 0,
+                   "tokens": 0, "prompt": 0, "completion": 0,
+                   "requests": 0, "elapsed_sum": 0.0, "elapsed_n": 0}
+               for k in day_keys}
+    per_model = {}
+    totals = {"runs": 0, "tasks": 0, "ok": 0, "failed": 0,
+              "tokens": 0, "prompt": 0, "completion": 0,
+              "requests": 0, "elapsed_sum": 0.0, "elapsed_n": 0}
+    incidents = {}
+    skipped = 0
+    meta_reads = 0
+    meta_capped = False
+    limit = DAILY_TOKENS_SOFT
+    prices = load_prices()
+    if prices is not None:
+        limit = int(prices.get("limits", {}).get("daily_tokens_soft", limit))
+    money_counted = bool(prices and prices.get("tariff", {}).get("money_counted"))
+    by_price = {}
+    if prices is not None:
+        by_price = {m["id"]: m for m in prices.get("models", [])
+                    if isinstance(m, dict)}
+
+    def _add(bucket, s):
+        bucket["runs"] += 1
+        bucket["tasks"] += int(s.get("total", 0))
+        bucket["ok"] += int(s.get("ok", 0))
+        bucket["failed"] += int(s.get("failed", 0))
+        bucket["tokens"] += int(s.get("total_tokens", 0) or 0)
+        bucket["prompt"] += int(s.get("prompt_tokens", 0) or 0)
+        bucket["completion"] += int(s.get("completion_tokens", 0) or 0)
+        bucket["requests"] += int(s.get("requests", 0) or 0)
+        el = s.get("elapsed_s")
+        if isinstance(el, (int, float)):
+            bucket["elapsed_sum"] += float(el)
+            bucket["elapsed_n"] += 1
+
+    if os.path.isdir(RUNS_DIR):
+        for name in sorted(os.listdir(RUNS_DIR)):
+            sp = os.path.join(RUNS_DIR, name, "summary.json")
+            if not os.path.isfile(sp):
+                continue
+            try:
+                with open(sp, encoding="utf-8") as f:
+                    s = json.load(f)
+            except (OSError, ValueError):
+                skipped += 1
+                continue
+            d = _samara_date(s.get("finished_at"))
+            if d is None or d.isoformat() not in per_day:
+                if d is None:
+                    skipped += 1
+                continue
+            key = d.isoformat()
+            _add(per_day[key], s)
+            _add(totals, s)
+            for t in s.get("tasks", []) or []:
+                model = t.get("model") or "—"
+                m = per_model.setdefault(model, {"tasks": 0, "ok": 0,
+                                                "tokens": 0, "prompt": 0,
+                                                "completion": 0})
+                m["tasks"] += 1
+                m["ok"] += 1 if t.get("ok") else 0
+                m["tokens"] += int(t.get("total_tokens", 0) or 0)
+                m["prompt"] += int(t.get("prompt_tokens", 0) or 0)
+                m["completion"] += int(t.get("completion_tokens", 0) or 0)
+                if t.get("ok"):
+                    continue
+                # Инцидент: причина из meta.json attempts; 0 попыток — без файла.
+                attempts = t.get("attempts", 0)
+                if not attempts:
+                    incidents["0 попыток (не запущена)"] = \
+                        incidents.get("0 попыток (не запущена)", 0) + 1
+                    continue
+                if meta_reads >= MAX_META_READS_WEEKLY:
+                    meta_capped = True
+                    continue
+                meta_path = os.path.join(
+                    t.get("dir") or os.path.join(RUNS_DIR, name,
+                                                 f"task-{t.get('idx')}"),
+                    "meta.json")
+                try:
+                    with open(meta_path, encoding="utf-8") as f:
+                        meta = json.load(f)
+                    meta_reads += 1
+                except (OSError, ValueError):
+                    incidents["meta.json не читается"] = \
+                        incidents.get("meta.json не читается", 0) + 1
+                    continue
+                errs = [a.get("error", "") for a in meta.get("attempts", [])
+                        if isinstance(a, dict)]
+                if not errs:
+                    incidents["без ошибки"] = incidents.get("без ошибки", 0) + 1
+                    continue
+                # Последняя попытка с ошибкой — причина падения задачи.
+                last = next((e for e in reversed(errs) if str(e).strip()), "")
+                cls = _classify_error(last)
+                incidents[cls] = incidents.get(cls, 0) + 1
+    cost = 0.0
+    if money_counted:
+        for model, m in per_model.items():
+            entry = by_price.get(model, {})
+            cost += (m["prompt"] * (entry.get("input_per_1m") or 0)
+                     + m["completion"] * (entry.get("output_per_1m") or 0)) / 1_000_000
+    top_models = sorted(per_model.items(), key=lambda kv: -kv[1]["tokens"])[:3]
+    daily_ratio = {k: round(v["tokens"] / limit, 3) if limit else 0.0
+                   for k, v in per_day.items()}
+    avg_latency = (totals["elapsed_sum"] / totals["elapsed_n"]
+                   if totals["elapsed_n"] else None)
+    iso = end.isocalendar()
+    return {
+        "end": end.isoformat(), "start": days[0].isoformat(),
+        "iso_week": f"{iso[0]}-W{iso[1]:02d}",
+        "days": day_keys, "per_day": per_day, "per_model": per_model,
+        "totals": totals, "incidents": incidents, "skipped": skipped,
+        "meta_reads": meta_reads, "meta_capped": meta_capped,
+        "cost": round(cost, 4), "money_counted": money_counted,
+        "limit": limit, "daily_ratio": daily_ratio,
+        "max_ratio": max(daily_ratio.values()) if daily_ratio else 0.0,
+        "top_models": [(m, v["tokens"], v["tasks"]) for m, v in top_models],
+        "avg_latency_s": round(avg_latency, 1) if avg_latency is not None else None,
+        "generated_at": _now_samara().isoformat(timespec="seconds"),
+    }
+
+
+def render_weekly(data):
+    """Markdown еженедельного отчёта по данным collect_week()."""
+    t = data["totals"]
+    lines = [
+        f"# Еженедельный отчёт роутера — {data['iso_week']} "
+        f"({data['start']} … {data['end']})",
+        "",
+        f"Сгенерирован: {data['generated_at']} (Самара). Провайдер: только Lix, "
+        f"безлимит 0x до 09.11.2026 — стоимость 0, считаются токены и запросы.",
+        "",
+        "## Итоги недели",
+        "",
+        f"- Прогонов: {t['runs']}, задач: {t['tasks']} "
+        f"(ok {t['ok']}, failed {t['failed']})",
+        f"- Токены: {t['tokens']} (prompt {t['prompt']}, completion {t['completion']}), "
+        f"запросов: {t['requests']}",
+        f"- Стоимость: {data['cost']} (money_counted={data['money_counted']})",
+        f"- Средняя латентность прогона: "
+        f"{data['avg_latency_s']} с" if data["avg_latency_s"] is not None
+        else "- Средняя латентность прогона: нет данных",
+        f"- Макс. дневной расход к бюджету {data['limit']}: {data['max_ratio']:.0%}",
+        "",
+        "## По дням",
+        "",
+        "| День | Прогоны | Задачи ok/failed | Токены | Запросы | Ср. латентность | Бюджет |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for k in data["days"]:
+        v = data["per_day"][k]
+        lat = (f"{v['elapsed_sum'] / v['elapsed_n']:.1f} с"
+               if v["elapsed_n"] else "—")
+        lines.append(
+            f"| {k} | {v['runs']} | {v['ok']}/{v['failed']} | {v['tokens']} | "
+            f"{v['requests']} | {lat} | {data['daily_ratio'][k]:.0%} |")
+    lines += ["", "## По моделям", "",
+              "| Модель | Задач | ok | Токены | Доля |",
+              "|---|---|---|---|---|"]
+    for model, m in sorted(data["per_model"].items(), key=lambda kv: -kv[1]["tokens"]):
+        share = (m["tokens"] / t["tokens"] * 100) if t["tokens"] else 0.0
+        lines.append(f"| {model} | {m['tasks']} | {m['ok']} | {m['tokens']} | {share:.1f}% |")
+    lines += ["", "## Топ-3 модели по токенам", ""]
+    for model, tokens, tasks in data["top_models"]:
+        lines.append(f"- {model}: {tokens} токенов, {tasks} задач")
+    if not data["top_models"]:
+        lines.append("- нет данных")
+    lines += ["", "## Инциденты", ""]
+    if data["incidents"]:
+        for cls, n in sorted(data["incidents"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"- {cls}: {n}")
+    else:
+        lines.append("- нет (все задачи за неделю ok)")
+    if data["meta_capped"]:
+        lines.append(f"- Примечание: чтение meta.json ограничено капом "
+                     f"{MAX_META_READS_WEEKLY} (прочитано {data['meta_reads']}) — "
+                     f"счёт инцидентов может быть неполным.")
+    if data["skipped"]:
+        lines.append(f"- Пропущено summary без даты: {data['skipped']}")
+    lines += ["",
+              f"Файл: reports/weekly-{data['iso_week']}.md",
+              ""]
+    return "\n".join(lines) + "\n"
+
+
+def weekly_report(end_date=None):
+    """Собрать отчёт за неделю, записать reports/weekly-YYYY-Www.md.
+    Возвращает (путь, данные)."""
+    data = collect_week(end_date)
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    path = os.path.join(REPORTS_DIR, f"weekly-{data['iso_week']}.md")
+    orch.atomic_write(path, render_weekly(data))
+    _log_event("router", "еженедельный отчёт", "ok",
+               f"{data['iso_week']}: {data['totals']['tokens']} токенов, "
+               f"{data['totals']['ok']}/{data['totals']['tasks']} задач ok")
+    return path, data
+
+
 # ---------------------------------------------------------------- CLI
 def cmd_pick(args):
     if args.refresh:
@@ -492,6 +856,13 @@ def cmd_status(args):
     budget = budget_check()
     print(f"  токены сегодня: {tokens} ({runs} прогонов), "
           f"бюджет {budget['limit']} ({budget['ratio']:.0%}) — {budget['status']}")
+    marker = sync_budget_marker(budget)
+    if marker:
+        print(f"  бюджет-фолбэк АКТИВЕН: {marker.get('status')} "
+              f"({marker.get('ratio', 0):.0%}), роль {marker.get('role')} -> "
+              f"{marker.get('model')}, маркер state/router-budget")
+    else:
+        print("  бюджет-фолбэк: не активен")
     print(f"  дедлайн Lix: {orch.lix_deadline_remaining(cfg)}")
     alert = alert_state()
     print(f"  алерт ключа: {'ЕСТЬ: ' + str(alert.get('reason')) if alert else 'нет'}")
@@ -516,6 +887,19 @@ def cmd_refresh(_args):
     return 1
 
 
+def cmd_weekly(args):
+    path, data = weekly_report(args.date)
+    t = data["totals"]
+    print(f"weekly {data['iso_week']} ({data['start']} … {data['end']}): "
+          f"{t['tokens']} токенов, {t['ok']}/{t['tasks']} задач ok, "
+          f"{t['runs']} прогонов, стоимость {data['cost']}")
+    print(f"топ-3: {', '.join(m for m, _, _ in data['top_models']) or '—'}; "
+          f"инциденты: {sum(data['incidents'].values())}; "
+          f"макс. бюджет дня: {data['max_ratio']:.0%}")
+    print(f"файл: {path}")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="fenrir_router")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -530,6 +914,10 @@ def main(argv=None):
     pr.set_defaults(fn=cmd_probe)
     rf = sub.add_parser("refresh")
     rf.set_defaults(fn=cmd_refresh)
+    wk = sub.add_parser("weekly")
+    wk.add_argument("--date", default=None,
+                    help="конец недели YYYY-MM-DD (по умолчанию сегодня, Самара)")
+    wk.set_defaults(fn=cmd_weekly)
     args = p.parse_args(argv)
     return args.fn(args)
 

@@ -19,6 +19,9 @@
 #   fenrir router pick --role code|review|text [--refresh] — выбор живой модели Lix
 #   fenrir router status [--probe] — health, токены за день, бюджет, алерт
 #   fenrir router probe | fenrir router refresh — health-проба / живой прайс
+#   fenrir router weekly [--date YYYY-MM-DD] — еженедельный отчёт по тратам
+#     (reports/weekly-YYYY-Www.md); при warn/over бюджета pick — фолбэк
+#     на самую дешёвую живую модель роли, маркер state/router-budget
 # Роутер v2.1 шаг 1 — fenrir_router.py в оркестре (только Lix; мёртвая тройка
 # 403 никогда не предлагается; qwen-flash жив и кандидат для text).
 # Планировщик v1.4 — fenrir_scheduler.py (ядро: tasks.yaml + runner).
