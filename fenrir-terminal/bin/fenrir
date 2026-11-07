@@ -22,6 +22,22 @@
 #     команды чтения; stop|start|restart — только после /confirm <id>
 #   fenrir remote notify <готово|упало|алерт> <текст> [--dry-run]
 #   fenrir remote allow <user_id> | config | listen [--timeout N]
+#   fenrir content add "<тема>" [--platform tiktok|telegram|both] [--queue] — контент v2.3:
+#     очередь тем + дедуп + стоп-лист; list | queue <id> | remove <id> |
+#     dedup "<тема>" | slots [--date YYYY-MM-DD] | render <id> [--duration N]
+#     [--dry-run] — рендер ролика (шаг 2, только локально). ПОСТИНГА НЕТ.
+#   fenrir project add <name> <folder> [--description "..."] [--tasks FNR-001,FNR-002] |
+#     list | show <name> | remove <name> — реестр проектов v3.3 шаг 1:
+#     только регистрация, без сборок и пайплайнов (только локально).
+#   fenrir update [--check] [--dry-run] — обновление из GitHub
+#     (Lumus-ai/fenrir-terminal, ветка main, только fast-forward;
+#     грязное дерево или защищённые файлы во входящих — отказ; снапшот
+#     в backups/ до pull, проверка py_compile + все сьюты после).
+#   fenrir selfpatch propose --file patch.json | list | show <id> |
+#     test <id> [--target DIR] | review <id> |
+#     apply <id> --approved [--target DIR] | rollback <id> [--target DIR] — саморазвитие v3.0 шаг 1:
+#     песочница самопатчей + очередь + тесты + откат (только локально).
+#     Живой код сам не меняется; apply — только с --approved (явное «да» Shadow).
 #   fenrir router pick --role code|review|text [--refresh] — выбор живой модели Lix
 #   fenrir router status [--probe] — health, токены за день, бюджет, алерт
 #   fenrir router probe | fenrir router refresh — health-проба / живой прайс
@@ -38,36 +54,70 @@
 # Утилиты (ram_guard, lix_countdown, health_summary, doctor, limits, usage) — fenrir_term.py.
 # Агент с циклом инструментов — fenrir_agent.py.
 set -u
+
+# run_py <модуль> [аргументы...] — запуск модуля терминала с понятной
+# ошибкой вместо сырого трейсбека (самопатч v3.0 P-003: кандидат 1 —
+# обработка ошибок при загрузке модулей).
+#   - файла нет → «модуль не найден» + путь, код выхода 1;
+#   - ModuleNotFoundError/SyntaxError → короткая подсказка, тот же код выхода;
+#   - иначе поведение как у прямого вызова python3, код выхода сохраняется.
+run_py() {
+  local mod="$1"; shift
+  local path="$mod"
+  case "$mod" in
+    /*) : ;;
+    *) path="$TERM_DIR/$mod" ;;
+  esac
+  if [ ! -f "$path" ]; then
+    echo "fenrir: модуль $mod не найден ($path)" >&2
+    echo "fenrir: проверьте установку терминала" >&2
+    return 1
+  fi
+  local err rc
+  err="$(mktemp)"
+  python3 "$path" "$@" 2>"$err"
+  rc=$?
+  cat "$err" >&2
+  if [ $rc -ne 0 ]; then
+    if grep -q "ModuleNotFoundError" "$err"; then
+      echo "fenrir: модуль $mod не загрузился — не найден импорт; проверьте файл $path" >&2
+    elif grep -q "SyntaxError" "$err"; then
+      echo "fenrir: в модуле $mod ошибка синтаксиса; проверьте файл $path (python3 -m py_compile $path)" >&2
+    fi
+  fi
+  rm -f "$err"
+  return $rc
+}
 ORCH="$HOME/workspace/fenrir-orchestra"
 TERM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 case "${1:-status}" in
   status)
     echo "🐺 Фенрир Терминал v1.3.1 — status"
     echo "---"
-    python3 "$TERM_DIR/fenrir_term.py" ram
-    python3 "$TERM_DIR/fenrir_term.py" lix
+    run_py fenrir_term.py ram
+    run_py fenrir_term.py lix
     echo "--- orchestra ---"
     curl -s -m 3 http://127.0.0.1:4097/health 2>/dev/null || echo "serve не отвечает (запуск: fenrir up)"
     echo "--- health (probe) ---"
-    python3 "$TERM_DIR/fenrir_term.py" health
+    run_py fenrir_term.py health
     ;;
   ram)
-    python3 "$TERM_DIR/fenrir_term.py" ram
+    run_py fenrir_term.py ram
     free -h
     echo "--- топ по RAM ---"
     ps aux --sort=-%mem | head -n 6
     ;;
   health)
-    python3 "$TERM_DIR/fenrir_term.py" health
+    run_py fenrir_term.py health
     ;;
   watchdog)
     bash "$TERM_DIR/bin/ram-watchdog.sh" && echo "watchdog ok (порог 300 МБ, лог: logs/ram-warnings.log)"
     ;;
   orchestra|orch)
-    python3 "$ORCH/fenrir_orchestra.py" status
+    run_py "$ORCH/fenrir_orchestra.py" status
     ;;
   probe)
-    python3 "$ORCH/fenrir_orchestra.py" probe
+    run_py "$ORCH/fenrir_orchestra.py" probe
     ;;
   up)
     bash "$ORCH/watchdog.sh"
@@ -75,54 +125,70 @@ case "${1:-status}" in
     curl -s http://127.0.0.1:4097/health; echo
     ;;
   doctor)
-    python3 "$TERM_DIR/fenrir_term.py" doctor
+    run_py fenrir_term.py doctor
     ;;
   limits)
-    python3 "$TERM_DIR/fenrir_term.py" limits
+    run_py fenrir_term.py limits
     ;;
   usage)
-    python3 "$TERM_DIR/fenrir_term.py" usage
+    run_py fenrir_term.py usage
     ;;
   agent)
     shift
-    python3 "$TERM_DIR/fenrir_agent.py" "$@"
+    run_py fenrir_agent.py "$@"
     ;;
   task)
     shift
-    python3 "$TERM_DIR/fenrir_scheduler.py" task "$@"
+    run_py fenrir_scheduler.py task "$@"
     ;;
   scheduler)
     shift
-    python3 "$TERM_DIR/fenrir_scheduler.py" run "$@"
+    run_py fenrir_scheduler.py run "$@"
     ;;
   morning)
     shift
-    python3 "$TERM_DIR/fenrir_digest.py" "$@"
+    run_py fenrir_digest.py "$@"
     ;;
   backup)
     shift
-    python3 "$TERM_DIR/fenrir_backup.py" "$@"
+    run_py fenrir_backup.py "$@"
     ;;
   funpay)
     shift
-    python3 "$TERM_DIR/fenrir_funpay.py" "$@"
+    run_py fenrir_funpay.py "$@"
     ;;
   router)
     shift
-    python3 "$ORCH/fenrir_router.py" "$@"
+    run_py "$ORCH/fenrir_router.py" "$@"
     ;;
   council)
     shift
-    python3 "$TERM_DIR/fenrir_council.py" "$@"
+    run_py fenrir_council.py "$@"
     ;;
   remote)
     shift
-    python3 "$TERM_DIR/fenrir_remote.py" "$@"
+    run_py fenrir_remote.py "$@"
+    ;;
+  content)
+    shift
+    run_py fenrir_content.py "$@"
+    ;;
+  selfpatch)
+    shift
+    run_py fenrir_selfpatch.py "$@"
+    ;;
+  project)
+    shift
+    run_py fenrir_project.py "$@"
+    ;;
+  update)
+    shift
+    run_py fenrir_update.py "$@"
     ;;
   down)
     pkill -f "fenrir_orchestra.py serv[e]" && echo "fenrir-orchestra остановлена" || echo "serve не работала"
     ;;
   *)
-    echo "fenrir: status | ram | health | watchdog | orchestra | probe | up | down | doctor | limits | usage | agent | task | scheduler | morning | backup | council | router"
+    echo "fenrir: status | ram | health | watchdog | orchestra | probe | up | down | doctor | limits | usage | agent | task | scheduler | morning | backup | council | router | content | remote | selfpatch | project | update"
     ;;
 esac
