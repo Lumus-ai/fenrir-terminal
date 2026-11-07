@@ -71,4 +71,4 @@
   - Ручной прогон нового скрипта в production: exit 0, «ok» в `logs/watchdog.log`.
 - Живой serve не пострадал: health OK до (uptime 9782.9с, pid 1962) и после (uptime ~10008с, тот же pid 1962).
 - НЕ проверено: реальное падение живого serve (не убивал намеренно); чтение маркера `state/watchdog-alert` в sleep-watch.sh — не вшито, sleep-watch не менялся.
-- Пуш в Lumus-ai/fenrir-terminal: коммит <SHA — вписать после пуша>.
+- Пуш в Lumus-ai/fenrir-terminal: коммит ff5acfd4bdfb0b69b65f44f56d980eaf81ea0a16 (ветка main, родитель 975630b4 — v1.3.1).
