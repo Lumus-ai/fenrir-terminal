@@ -36,6 +36,12 @@ Python: py_compile) и дописывает, пока не станет чист
   python3 fenrir_agent.py --workdir <папка> --task "<задача>"
   python3 fenrir_agent.py --file tasks.jsonl   # очередь задач
   python3 fenrir_agent.py --workdir <папка> --task "..." --kind text
+  python3 fenrir_agent.py --workdir <папка> --task "..." --provider klinch
+Провайдер: по умолчанию — ТОЛЬКО Lix (приказ Shadow 06.11.2026 ~11:30).
+--provider klinch — ЕДИНСТВЕННОЕ исключение: планировщик v1.4
+(fenrir_scheduler.py, приказ Shadow 06.11.2026 ~21:30) запускает
+свои задачи на Klinch. Вне планировщика --provider klinch не
+использовать.
 """
 import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.request
 
@@ -45,6 +51,9 @@ from dynamic_credentials import add_surrogate_to_request, read_json_response
 UA = "fenrir-agent/1.0"
 HOSTS = {
     "custom.lix": ("https://lix.autos/v1", ["lix.autos"]),
+    # Klinch — ТОЛЬКО для планировщика v1.4 (приказ Shadow 06.11 ~21:30).
+    # Хост и суррогатный ключ — как в fenrir_orchestra.py / custom.klinch.
+    "custom.klinch": ("https://api.klinch.cloud/v1", ["api.klinch.cloud"]),
 }
 # Порядок важен: первый живой берётся, при 403/429/5xx — следующий.
 # ТОЛЬКО Lix — приказ Shadow 06.11.2026 ~11:30 (Klinch/Anymodel запрещены).
@@ -58,6 +67,18 @@ CHAINS = {
     "text": [("custom.lix", "qwen3.8-max"),
              ("custom.lix", "deepseek-v4.1-flash"),
              ("custom.lix", "kimi-k3")],
+}
+# Цепочки Klinch — ТОЛЬКО для планировщика v1.4 (исключение из
+# «только Lix», приказ Shadow 06.11.2026 ~21:30). gpt-6-luna доказала
+# вызовы инструментов живьём 06.11.2026 (klinch7, вернула tool_calls);
+# гейтвей обслуживает её бэкендом grok-4.7. grok-4.7 — второй в
+# цепочке: это модель, прикреплённая к ключу custom.klinch
+# (klinch_probe.py models, 07.11.2026).
+KLINCH_CHAINS = {
+    "code": [("custom.klinch", "gpt-6-luna"),
+             ("custom.klinch", "grok-4.7")],
+    "text": [("custom.klinch", "gpt-6-luna"),
+             ("custom.klinch", "grok-4.7")],
 }
 
 SYSTEM = (
@@ -401,8 +422,18 @@ def run_task(task, workdir, kind, chain, max_steps, log):
         return True, used
     return False, used
 
-def build_chain(kind, connector, model):
-    chain = list(CHAINS.get(kind, CHAINS["code"]))
+def build_chain(kind, connector=None, model=None, provider=None):
+    """Цепочка моделей для задачи.
+
+    provider=None (дефолт) — Lix (CHAINS), дефолт НЕ менялся.
+    provider="lix" — явно Lix. provider="klinch" — цепочка Klinch
+    (KLINCH_CHAINS), только для планировщика v1.4 — исключение из
+    «только Lix» (приказ Shadow 06.11.2026 ~21:30).
+    """
+    if provider == "klinch":
+        chain = list(KLINCH_CHAINS.get(kind, KLINCH_CHAINS["code"]))
+    else:
+        chain = list(CHAINS.get(kind, CHAINS["code"]))
     if connector and model:
         pair = (connector, model)
         chain = [pair] + [p for p in chain if p != pair]
@@ -412,6 +443,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--connector", default=None)
     ap.add_argument("--model", default=None)
+    ap.add_argument("--provider", default=None, choices=["klinch", "lix"],
+                    help="провайдер цепочки (дефолт: lix). klinch — "
+                         "только для планировщика v1.4")
     ap.add_argument("--kind", default="code", choices=["code", "text"])
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--task", default=None)
@@ -438,7 +472,9 @@ def main():
                 print(s)
                 _lines.append(s)
             kind = t.get("kind", a.kind)
-            chain = build_chain(kind, t.get("connector", a.connector), t.get("model", a.model))
+            chain = build_chain(kind, t.get("connector", a.connector),
+                                t.get("model", a.model),
+                                provider=t.get("provider", a.provider))
             ok, used = run_task(t["task"], t["workdir"], kind, chain,
                                 int(t.get("max_steps", a.max_steps)), log)
             with open(task_log, "w", encoding="utf-8") as f:
@@ -454,7 +490,7 @@ def main():
 
     if not a.task or not a.workdir:
         ap.error("--task и --workdir обязательны (или --file для очереди)")
-    chain = build_chain(a.kind, a.connector, a.model)
+    chain = build_chain(a.kind, a.connector, a.model, provider=a.provider)
     ok, used = run_task(a.task, a.workdir, a.kind, chain, a.max_steps, print)
     print("done" if ok else "FAILED")
     return 0 if ok else 1

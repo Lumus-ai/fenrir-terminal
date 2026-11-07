@@ -1,0 +1,25 @@
+version: "1.4"
+updated: 2026-11-07T15:40:00+04:00
+tasks:
+  - id: FNR-001
+    title: "Проверка статуса терминала"
+    task: "Проверь, что в workdir есть файл STATUS.md. Если его нет — создай его с одной строкой: дата и время проверки и слово OK. Если есть — допиши в конец одну строку с датой и временем проверки и словом OK. Больше ничего не делай."
+    workdir: "~/workspace/fenrir-terminal/scheduler-tasks/status-check"
+    status: todo
+    kind: code
+    provider: klinch
+    schedule: manual
+    max_steps: 15
+    priority: P2
+    created: 2026-11-07T15:40:00+04:00
+  - id: FNR-002
+    title: "Проверка диска и RAM"
+    task: "Вызови list_dir и запиши в файл report.txt в workdir список файлов этой папки и одну строку с датой проверки. Больше ничего не делай."
+    workdir: "~/workspace/fenrir-terminal/scheduler-tasks/disk-check"
+    status: todo
+    kind: code
+    provider: klinch
+    schedule: manual
+    max_steps: 15
+    priority: P3
+    created: 2026-11-07T15:40:00+04:00

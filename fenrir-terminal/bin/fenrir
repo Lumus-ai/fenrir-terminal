@@ -5,6 +5,9 @@
 #   fenrir doctor | fenrir limits | fenrir usage
 #   fenrir agent --task "..." --workdir <папка> [--kind code|text]
 #   fenrir agent --file tasks.jsonl
+#   fenrir task add|done|list|run|validate [--tasks tasks.yaml]
+#   fenrir scheduler --once [--dry-run] [--tasks tasks.yaml] [--task-id ID]
+# Планировщик v1.4 — fenrir_scheduler.py (ядро: tasks.yaml + runner).
 # Утилиты (ram_guard, lix_countdown, health_summary, doctor, limits, usage) — fenrir_term.py.
 # Агент с циклом инструментов — fenrir_agent.py.
 set -u
@@ -57,10 +60,18 @@ case "${1:-status}" in
     shift
     python3 "$TERM_DIR/fenrir_agent.py" "$@"
     ;;
+  task)
+    shift
+    python3 "$TERM_DIR/fenrir_scheduler.py" task "$@"
+    ;;
+  scheduler)
+    shift
+    python3 "$TERM_DIR/fenrir_scheduler.py" run "$@"
+    ;;
   down)
     pkill -f "fenrir_orchestra.py serv[e]" && echo "fenrir-orchestra остановлена" || echo "serve не работала"
     ;;
   *)
-    echo "fenrir: status | ram | health | watchdog | orchestra | probe | up | down | doctor | limits | usage | agent"
+    echo "fenrir: status | ram | health | watchdog | orchestra | probe | up | down | doctor | limits | usage | agent | task | scheduler"
     ;;
 esac

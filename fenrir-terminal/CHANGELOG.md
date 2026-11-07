@@ -1,5 +1,67 @@
 # Fenrir Terminal — Changelog
 
+## v1.4-планировщик (ядро) — 07.11.2026
+
+- Ядро планировщика (`fenrir_scheduler.py`, stdlib only): единый
+  `tasks.yaml` (путь `~/workspace/fenrir-terminal/tasks.yaml`),
+  CLI `fen task add/done/list/run/validate` и runner
+  `fen scheduler --once` (один проход; цикл — внешний крон раз в
+  10 мин, крон НЕ создавался — его ставит человек:
+  `*/10 * * * * .../bin/fenrir scheduler --once`).
+- Формат tasks.yaml — YAML-подмножество со строгим парсером
+  (`parse_yaml_subset`) и дампером (`dump_tasks_yaml`): отображения,
+  списки отображений, скаляры (кавычки/plain/int/bool/null),
+  flow-списки `[a, b]`, комментарии. `|`, `>`, `&`, `*`, `{...}`,
+  табы — ошибка с номером строки. Выбор обоснован в шапке модуля:
+  YAML требует спека, а JSON с расширением .yaml вводил бы в
+  заблуждение; зависимостей не добавлено (PyYAML нет в stdlib).
+- Схема задачи: id/title/task/workdir/status обязательны;
+  kind code|text, provider klinch|lix (по умолчанию klinch),
+  schedule manual|cron 5 полей, due ISO, max_steps 1..100,
+  priority P0..P3, created/last_run/last_result. Валидация строгая:
+  неизвестные ключи, дубли id, workdir вне ~/workspace, плохой
+  cron/due — ошибка. Пути из спеки (~/fenrir, /opt/fenrir) НЕ
+  брались — реальный путь tasks.yaml в терминале.
+- Runner: только задачи todo с наступившим временем (due или
+  cron-окно 10 мин с защитой от повтора по last_run); cron-задачи
+  после выполнения остаются todo (рекуррентные), разовые — done/
+  failed. Запись tasks.yaml атомарная после каждой задачи; lock
+  `logs/scheduler.lock` (битый старше 10 мин пересоздаётся);
+  всё — в `logs/scheduler.log` с ротацией >1 МБ.
+- Безопасность: задачи выполняются ТОЛЬКО через
+  `fenrir_agent.run_task` (файлы — только внутри workdir задачи).
+  Типы command/script/http_request из спеки (пачка 2) в ядро НЕ
+  вошли сознательно — это произвольный код по ручному файлу.
+  Начальный tasks.yaml — только 2 безопасных примера (manual, без
+  due — автоматически не выполняются): проверка статуса и список
+  файлов папки.
+- Провайдер планировщика — Klinch (приказ Shadow 06.11 ~21:30,
+  единственное исключение из «только Lix»): `fenrir_agent.py` —
+  HOSTS + `custom.klinch` (api.klinch.cloud), KLINCH_CHAINS
+  code/text = gpt-6-luna → grok-4.7, опция `--provider
+  klinch|lix` (и поле provider в --file). Дефолт агента без
+  опции НЕ менялся — Lix. gpt-6-luna доказала вызовы инструментов
+  06.11.2026; на ключе custom.klinch прикреплены только модели
+  Grok (проверено живьём 07.11.2026: grok-4.7/4.6/4.5/4.3/
+  build-0.1; день сброшен, used 0, left 200M).
+- Проверки живьём 07.11.2026: `test_scheduler.py` — 57 проверок
+  (парсер/дампер/round-trip, валидация, cron, due, CLI add→list→
+  done→list на временном файле) — все прошли. `fenrir task
+  validate/list` на реальном tasks.yaml — OK; битый tasks.yaml
+  отклоняется (exit 1, ошибки по полям). Dry-run runner'а нашёл
+  due-задачу (TST-001). Полный прогон runner'а на Klinch:
+  gpt-6-luna (бекенд grok-4.7), 2 шага, tool_calls write_file,
+  verify OK, задача помечена done, ran=1 ok=1, exit 0.
+  Найденный дефект и лечение: в первом прогоне модель выдумала
+  дату в STATUS.md («2025-01-18 14:30:00») — у неё нет часов;
+  runner теперь подставляет текущее время Самары в текст задачи,
+  повторный прогон (TST-002) дал верную дату «2026-11-07
+  15:41:28 +04 OK». Lix как fallback для механики не понадобился
+  (Klinch ответил с первого раза). `fenrir status` — по-прежнему
+  v1.3.1, serve не тронут, версия терминала не менялась.
+- НЕ сделано в этой задаче (части 2–4 v1.4 — отдельные задачи):
+  утренний дайджест, бэкап на Drive, авто-журлог.
+
 ## RAM guard v2 — 07.11.2026 (пороги и эскалация, авточистка)
 
 - Пороги те же, что в v1: OK ≥500 / WARN 300–499 / CRIT <300 МБ
