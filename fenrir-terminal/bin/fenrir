@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fenrir Terminal v1.3 — команда-идентификатор: кто я, что живо, сколько памяти.
+# Fenrir Terminal v1.3.1 — команда-идентификатор: кто я, что живо, сколько памяти.
 # Использование: fenrir | fenrir status | fenrir ram | fenrir orchestra
 #   fenrir probe | fenrir health | fenrir watchdog | fenrir up | fenrir down
 #   fenrir doctor | fenrir limits | fenrir usage
@@ -12,7 +12,7 @@ ORCH="$HOME/workspace/fenrir-orchestra"
 TERM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 case "${1:-status}" in
   status)
-    echo "🐺 Фенрир Терминал v1.3 — status"
+    echo "🐺 Фенрир Терминал v1.3.1 — status"
     echo "---"
     python3 "$TERM_DIR/fenrir_term.py" ram
     python3 "$TERM_DIR/fenrir_term.py" lix

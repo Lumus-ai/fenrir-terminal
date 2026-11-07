@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Fenrir Terminal v1.3 — агент с циклом инструментов.
+"""Fenrir Terminal v1.3.1 — агент с циклом инструментов.
+
+v1.3.1: detect_done — агент распознаёт «работа готова»: если файлы на
+диске чистые (verify_workdir) и последние раунды вызовов не меняют
+файлы (или повторяют одни и те же вызовы), цикл завершается с True
+вместо кручения до max_steps. Никогда True, пока verify не проходит
+или модель просит подтверждения. См. detect_done() ниже.
 
 Почему Луна «не писала файлы»: сама модель файлы не пишет никогда —
 она только ВОЗВРАЩАЕТ вызов инструмента (tool_calls). Файл на диск
@@ -31,7 +37,7 @@ Python: py_compile) и дописывает, пока не станет чист
   python3 fenrir_agent.py --file tasks.jsonl   # очередь задач
   python3 fenrir_agent.py --workdir <папка> --task "..." --kind text
 """
-import argparse, json, os, re, subprocess, sys, time, urllib.request
+import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.request
 
 sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
 from dynamic_credentials import add_surrogate_to_request, read_json_response
@@ -62,7 +68,8 @@ SYSTEM = (
     "2. Никогда не пиши </body></html> (и вообще закрывающие теги документа) раньше времени — только в самом последнем куске.\n"
     "3. Перед дописыванием проверь хвост файла через read_file: он возвращает последние 4000 символов. Не дублируй уже написанные секции — сверяйся с хвостом.\n"
     "4. Один инструмент за шаг, если содержимое большое. Не объясняй план текстом вместо вызова инструмента.\n"
-    "5. Когда файл готов — вызови read_file и убедись, что он полный, и только потом отвечай текстом."
+    "5. Когда файл готов — вызови read_file и убедись, что он полный, и только потом отвечай текстом.\n"
+    "6. Когда работа готова — НЕ вызывай больше инструменты. Ответь коротким текстом «Готово, задача выполнена» и остановись. Не перепроверяй готовый файл повторными вызовами."
 )
 
 TOOLS = [
@@ -216,6 +223,65 @@ def verify_workdir(workdir):
                 issues.append(f"{rel}: не компилируется: {(r.stderr or '').strip().splitlines()[-1][:200]}")
     return issues
 
+def _asks_confirmation(text):
+    """Модель просит подтверждения или ввода — завершаться нельзя."""
+    return bool(re.search(
+        r"подтвердите|продолжить\?|хотите\s+ли|вы\s+уверены|могу\s+ли\s+я"
+        r"|что\s+делать\s+дальше|как\s+поступить|подтверждаете",
+        text or "", re.IGNORECASE))
+
+
+def _workdir_fingerprint(workdir):
+    """Состояние файлов (путь, размер, sha1) — для детекции отсутствия прогресса."""
+    items = []
+    for p in _iter_files(workdir):
+        try:
+            with open(p, "rb") as f:
+                digest = hashlib.sha1(f.read()).hexdigest()[:12]
+            items.append((os.path.relpath(p, workdir), os.path.getsize(p), digest))
+        except OSError:
+            continue
+    return tuple(sorted(items))
+
+
+def _call_signature(call):
+    """Нормализованная сигнатура вызова инструмента для детектора зацикливания."""
+    try:
+        args = json.loads(call["function"]["arguments"] or "{}")
+    except ValueError:
+        args = {}
+    return (call["function"]["name"],
+            json.dumps(args, sort_keys=True, ensure_ascii=False))
+
+
+def detect_done(text="", verify_ok=False, no_progress_rounds=0, recent_calls=None):
+    """v1.3.1: эвристики завершения (шаг 1 из спеки, адаптированы под процедурный цикл).
+
+    Возвращает (done, reason). Никогда True, пока verify не проходит
+    или модель просит подтверждения. Сигналы (по приоритету):
+    - модель просит подтверждение -> False;
+    - verify не проходит -> False;
+    - >=2 раундов вызовов подряд без изменения файлов -> True;
+    - 3 одинаковых раунда вызовов подряд -> True;
+    - явный маркер завершения в ответе -> True.
+    Пустой ответ без других сигналов -> False.
+    """
+    if _asks_confirmation(text):
+        return False, "модель просит подтверждение"
+    if not verify_ok:
+        return False, "verify не проходит"
+    if no_progress_rounds >= 2:
+        return True, f"файлы готовы, {no_progress_rounds} раунда без изменений"
+    if recent_calls and len(recent_calls) >= 3:
+        last3 = recent_calls[-3:]
+        if last3[0] and len(set(last3)) == 1:
+            return True, "зацикливание: 3 одинаковых раунда вызовов подряд"
+    if re.search(r"\[FINAL_ANSWER\]|\[WORK_DONE\]|задача выполнена"
+                 r"|работа завершена|готово", text or "", re.IGNORECASE):
+        return True, "явный маркер завершения в ответе"
+    return False, "нет сигнала завершения"
+
+
 def chat_once(connector, model, messages, max_tokens=2000):
     base, hosts = HOSTS[connector]
     body = json.dumps({"model": model, "messages": messages, "tools": TOOLS,
@@ -252,6 +318,10 @@ def run_task(task, workdir, kind, chain, max_steps, log):
     asked_verify = False
     empty_streak = 0
     used = None
+    # v1.3.1 detect_done: состояние для детекции отсутствия прогресса.
+    prev_fingerprint = None
+    no_progress = 0
+    recent_calls = []
     for step in range(1, max_steps + 1):
         try:
             d, used_c, used_m = chat(chain, messages)
@@ -280,6 +350,12 @@ def run_task(task, workdir, kind, chain, max_steps, log):
                 messages.append({"role": "user", "content": "Файл ещё не создан. Не объясняй план — вызови инструмент write_file или append_file прямо сейчас."})
                 log("nudge: no write yet")
                 continue
+            # v1.3.1 detect_done: модель просит подтверждение — не завершаем.
+            if _asks_confirmation(text):
+                messages.append({"role": "assistant", "content": text})
+                messages.append({"role": "user", "content": "Подтверждаю: работа готова. Ответь коротко «Готово, задача выполнена» без новых вызовов инструментов."})
+                log("detect_done: модель просит подтверждение — не завершаем")
+                continue
             # Локальная верификация — истина на диске, а не слова модели.
             issues = verify_workdir(workdir)
             if issues:
@@ -304,7 +380,25 @@ def run_task(task, workdir, kind, chain, max_steps, log):
                 result = f"error: {e}"
                 log(f"  tool {call['function']['name']} -> {result}")
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+        # v1.3.1 detect_done: после выполнения инструментов — есть ли прогресс?
+        fp = _workdir_fingerprint(workdir)
+        if fp == prev_fingerprint:
+            no_progress += 1
+        else:
+            no_progress = 0
+            prev_fingerprint = fp
+        recent_calls.append(tuple(_call_signature(c) for c in calls))
+        done, reason = detect_done(
+            verify_ok=wrote and not verify_workdir(workdir),
+            no_progress_rounds=no_progress, recent_calls=recent_calls)
+        if done:
+            log(f"detect_done: {reason} — завершаем с True")
+            return True, used
     log("max steps reached")
+    # v1.3.1: лимит шагов, но работа на диске сделана — это успех, а не провал.
+    if wrote and not verify_workdir(workdir):
+        log("detect_done: лимит шагов, но файлы на диске чистые — работа сделана")
+        return True, used
     return False, used
 
 def build_chain(kind, connector, model):
