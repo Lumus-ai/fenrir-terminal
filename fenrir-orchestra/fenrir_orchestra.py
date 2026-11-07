@@ -29,6 +29,8 @@ max_tokens по умолчанию 2000, каждый ответ пишется 
     python3 fenrir_orchestra.py probe
     python3 fenrir_orchestra.py run --task "..." [--role code|review|text]
     python3 fenrir_orchestra.py council --task "..." [--workers 3]
+    python3 fenrir_orchestra.py council31 --task "..." [--workdir DIR] [--file F] [--dry-run]
+        # v3.1: 3 роли (кодер/ревьюер/тестер), синтез + отчёт
     python3 fenrir_orchestra.py batch --file tasks.jsonl [--max-tokens 2000]
     python3 fenrir_orchestra.py serve [--port 4097] [--host 127.0.0.1]
     python3 fenrir_orchestra.py status
@@ -366,16 +368,13 @@ def cmd_probe(_args):
 
 
 # ---------------------------------------------------------------- run
-def do_run(task, role, max_tokens, out_dir=None, rid=None):
-    """Пробегает фолбэк-цепочку роли. Пишет runs/<id>/answer.md + meta.json
-    сразу при первом успехе. Возвращает (ok, rid, out_dir, meta_or_error)."""
+def _do_run_chain(task, role, chain, max_tokens, out_dir, rid):
+    """Пробегает заданную цепочку (provider, model). Пишет answer.md +
+    meta.json сразу при первом успехе. Возвращает (ok, rid, out_dir, meta)."""
     cfg = load_config()
-    rid = rid or run_id()
-    out_dir = out_dir or os.path.join(RUNS_DIR, rid)
     os.makedirs(out_dir, exist_ok=True)
     atomic_write_json(os.path.join(out_dir, "task.json"),
                       {"id": rid, "role": role, "task": task, "started_at": now_iso()})
-    chain = chain_for_role(cfg, role)
     attempts = []
     for pname, model in chain:
         prov = cfg["providers"][pname]
@@ -394,6 +393,16 @@ def do_run(task, role, max_tokens, out_dir=None, rid=None):
             "attempts": attempts, "finished_at": now_iso(), "ok": False}
     atomic_write_json(os.path.join(out_dir, "meta.json"), meta)
     return False, rid, out_dir, meta
+
+
+def do_run(task, role, max_tokens, out_dir=None, rid=None):
+    """Пробегает фолбэк-цепочку роли. Пишет runs/<id>/answer.md + meta.json
+    сразу при первом успехе. Возвращает (ok, rid, out_dir, meta_or_error)."""
+    cfg = load_config()
+    rid = rid or run_id()
+    out_dir = out_dir or os.path.join(RUNS_DIR, rid)
+    return _do_run_chain(task, role, chain_for_role(cfg, role),
+                         max_tokens, out_dir, rid)
 
 
 def cmd_run(args):
@@ -478,6 +487,224 @@ def cmd_council(args):
         stub += "\nЧитайте worker-файлы напрямую — они полные и сохранены на диске.\n"
         atomic_write(synth_path, stub)
         print("synthesis: FALLBACK stub (см. synthesis.md)")
+    print(f"dir: {out_dir}")
+    return 0 if any(r[2] for r in results) else 1
+
+
+# ---------------------------------------------------------------- council v3.1
+# Спека v3.1 (PLAN-EXTENDED.md, раздел 8): три роли — кодер, ревьюер,
+# тестер — каждая со своей моделью и своим workdir; синтез сводит
+# результаты в один файл + отчёт, конфликты — в отчёт. Без мёртвого
+# совета Оркестры: консилиум = прямые вызовы + синтез.
+# Лимит спеки «не больше 6 воркеров» перекрыт приказом Shadow
+# 06.11.2026 ~19:22: МАКСИМУМ 3 параллельных вызова ВСЕГДА
+# (MAX_PARALLEL=3). Три роли = ровно 3 параллельных вызова.
+# Старый 6-ролевой council выше НЕ трогается — он остаётся доступен.
+COUNCIL_V31_ROLES = [
+    # (имя, роль цепочки, закреплённая живая модель Lix, системный промпт)
+    ("coder", "code", "lix/deepseek-v4-pro",
+     "Ты кодер консилиума. Реши задачу: напиши код или конкретный план "
+     "решения. Коротко, по делу, только то, что просили."),
+    ("reviewer", "review", "lix/glm-5.3-prime",
+     "Ты ревьюер консилиума. Проверь решение задачи: найди слабые места, "
+     "риски, ошибки и несоответствия. Предложи конкретные исправления. "
+     "Если решения ещё нет — ревьюй саму задачу и её подводные камни."),
+    ("tester", "code", "lix/kimi-k3",
+     "Ты тестер консилиума. Придумай проверки для решения задачи: "
+     "тест-кейсы, краевые случаи, как убедиться, что оно работает. "
+     "Если решения ещё нет — опиши, как его надо проверять."),
+]
+COUNCIL_V31_PARALLEL = 3  # ровно MAX_PARALLEL, не больше
+
+
+def chain_for_role_pinned(cfg, role, pinned):
+    """Цепочка роли с закреплённой моделью первой: сначала pinned,
+    потом остальные живые модели цепочки (без cooldown и без мёртвой
+    тройки по роутеру). Возвращает [(provider, model), ...]."""
+    chain = chain_for_role(cfg, role)
+    pname, model = pinned.split("/", 1)
+    dead = _router_dead()
+    pinned_ok = model not in dead and not is_cooldown(f"{pname}/{model}")
+    out = []
+    if pinned_ok:
+        out.append((pname, model))
+    for p, m in chain:
+        if (p, m) not in out:
+            out.append((p, m))
+    return out
+
+
+def do_run_pinned(task, role, pinned, max_tokens, out_dir=None, rid=None):
+    """Как do_run, но цепочка роли начинается с закреплённой модели."""
+    cfg = load_config()
+    rid = rid or run_id()
+    out_dir = out_dir or os.path.join(RUNS_DIR, rid)
+    return _do_run_chain(task, role, chain_for_role_pinned(cfg, role, pinned),
+                         max_tokens, out_dir, rid)
+
+
+def _extract_section(text, title):
+    """Достаёт раздел '## TITLE ...' (до следующего '## ') из текста.
+    Возвращает тело раздела или ''."""
+    import re
+    m = re.search(r"(?m)^#{1,3}\s*" + re.escape(title) + r"\s*\n(.*?)(?=^#{1,3}\s|\Z)",
+                  text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def build_council_report(rid, task, results, synthesis, synth_ok):
+    """Короткий отчёт консилиума: вердикт + статусы ролей + конфликты.
+    results: [(name, model_used, ok, meta)]. synthesis: текст синтеза."""
+    verdict = _extract_section(synthesis, "ВЕРДИКТ") if synth_ok else ""
+    conflicts = _extract_section(synthesis, "КОНФЛИКТЫ") if synth_ok else ""
+    lines = [f"# Отчёт консилиума v3.1 — {rid}",
+             "",
+             f"Задача: {task[:300]}",
+             ""]
+    lines.append("## Вердикт")
+    lines.append(verdict if verdict else
+                 ("(вердикт не выделен синтезом — см. synthesis.md)" if synth_ok
+                  else "(синтез недоступен — см. файлы ролей)"))
+    lines.append("")
+    lines.append("## Роли")
+    for name, model, ok, _meta in results:
+        lines.append(f"- {name}: {model} — {'ok' if ok else 'FAILED'}")
+    lines.append("")
+    lines.append("## Конфликты")
+    if not synth_ok:
+        lines.append("Неизвестны: синтез не отработал, сверьте файлы ролей "
+                     "вручную (coder.md / reviewer.md / tester.md).")
+    elif conflicts:
+        lines.append(conflicts)
+    else:
+        lines.append("В синтезе раздел конфликтов не выделен — явных "
+                     "противоречий между ролями не зафиксировано, "
+                     "см. synthesis.md.")
+    lines.append("")
+    lines.append("## Файлы")
+    lines.append("- coder.md / reviewer.md / tester.md — ответы ролей")
+    lines.append("- synthesis.md — сведённый итог координатора")
+    lines.append("- council.json — машиночитаемая сводка")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_council31(args):
+    """Консилиум v3.1: 3 роли параллельно (кодер/ревьюер/тестер), каждая
+    со своей закреплённой живой моделью Lix и своим workdir; затем
+    синтез координатора в synthesis.md + короткий отчёт report.md.
+    --dry-run: без вызовов моделей, файлы-заглушки для проверки обвязки."""
+    if args.file:
+        with open(args.file, encoding="utf-8") as f:
+            task = f.read().strip()
+    else:
+        task = args.task
+    if not task:
+        print("council31: пустая задача (--task или --file)")
+        return 2
+    cfg = load_config()
+    rid = run_id()
+    out_dir = args.workdir or os.path.join(RUNS_DIR, rid)
+    os.makedirs(out_dir, exist_ok=True)
+    atomic_write_json(os.path.join(out_dir, "task.json"),
+                      {"id": rid, "kind": "council31", "task": task,
+                       "roles": [r[0] for r in COUNCIL_V31_ROLES],
+                       "started_at": now_iso()})
+
+    def worker_job(name, role, pinned, system):
+        wdir = os.path.join(out_dir, name)
+        prompt = system + "\n\nЗадача:\n" + task
+        if args.dry_run:
+            os.makedirs(wdir, exist_ok=True)
+            atomic_write(os.path.join(wdir, "answer.md"),
+                         f"[dry-run] {name}: ответ не вызывался\n")
+            atomic_write(os.path.join(out_dir, f"{name}.md"),
+                         f"[dry-run] {name}: ответ не вызывался\n")
+            atomic_write_json(os.path.join(wdir, "meta.json"),
+                              {"id": rid, "role": role, "provider": "dry-run",
+                               "model_actual": pinned, "dry_run": True,
+                               "finished_at": now_iso()})
+            return name, pinned, True, {"provider": "dry-run",
+                                        "model_actual": pinned, "dry_run": True}
+        ok, _wrid, _d, meta = do_run_pinned(prompt, role, pinned,
+                                            args.max_tokens, out_dir=wdir)
+        if ok:
+            with open(os.path.join(wdir, "answer.md"), encoding="utf-8") as f:
+                atomic_write(os.path.join(out_dir, f"{name}.md"), f.read())
+        return name, meta.get("model_actual") or pinned, ok, meta
+
+    results = []
+    with ThreadPoolExecutor(max_workers=COUNCIL_V31_PARALLEL) as pool:
+        futs = {pool.submit(worker_job, n, r, p, s): n
+                for n, r, p, s in COUNCIL_V31_ROLES}
+        for fut in as_completed(futs):
+            results.append(fut.result())
+    order = {n: i for i, (n, _r, _p, _s) in enumerate(COUNCIL_V31_ROLES)}
+    results.sort(key=lambda t: order[t[0]])
+    print(f"council31 {rid}: roles ok="
+          f"{sum(1 for r in results if r[2])}/{len(results)}")
+    for name, model, ok, _meta in results:
+        print(f"  {name}: {model} {'ok' if ok else 'FAILED'}")
+
+    # Синтез координатора — последовательный вызов после ролей.
+    # Промпт требует структуру: ВЕРДИКТ / ИТОГ / КОНФЛИКТЫ / РИСКИ / ДАЛЬШЕ.
+    worker_texts = []
+    for name, _model, ok, meta in results:
+        p = os.path.join(out_dir, f"{name}.md")
+        if ok and os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                worker_texts.append(f"## Роль {name} "
+                                    f"({meta.get('provider')}/{meta.get('model_actual')})\n\n{f.read()}")
+        else:
+            worker_texts.append(f"## Роль {name}\n\nFAILED: "
+                                f"{(meta.get('attempts') or [{}])[-1].get('error', 'unknown')}")
+    synth_prompt = (
+        "Ты координатор консилиума. Сведи мнения трёх ролей ниже в один "
+        "итог СТРОГО по разделам (заголовки ## ВЕРДИКТ, ## ИТОГОВОЕ РЕШЕНИЕ, "
+        "## КОНФЛИКТЫ, ## РИСКИ, ## ДАЛЬШЕ). В разделе КОНФЛИКТЫ перечисли, "
+        "где роли противоречат друг другу; если противоречий нет — так и "
+        "напиши. Максимум ~1500 токенов.\n\n" + "\n\n".join(worker_texts))
+    synth_path = os.path.join(out_dir, "synthesis.md")
+    synth_ok = False
+    synthesis = ""
+    if args.dry_run:
+        synthesis = ("## ВЕРДИКТ\n[dry-run] синтез не вызывался\n\n"
+                     "## КОНФЛИКТЫ\n[dry-run] нет данных\n")
+        atomic_write(synth_path, synthesis)
+        synth_ok = True
+        print("synthesis: dry-run stub")
+    else:
+        ok, _srid, _d, meta = do_run(synth_prompt, "text", DEFAULT_MAX_TOKENS,
+                                     out_dir=os.path.join(out_dir, "synthesis-tmp"))
+        if ok:
+            with open(os.path.join(out_dir, "synthesis-tmp", "answer.md"),
+                      encoding="utf-8") as f:
+                synthesis = f.read()
+            atomic_write(synth_path, synthesis)
+            synth_ok = True
+            print(f"synthesis: {meta.get('provider')}/{meta.get('model_actual')}")
+        else:
+            stub = ("# Синтез (авто-синтез недоступен — все модели синтеза упали)\n\n"
+                    "Синтез-модель не ответила, поэтому итог — ручная сводка "
+                    "по файлам ролей:\n\n")
+            for name, _m, wok, _meta in results:
+                stub += f"- {name}.md: {'ok' if wok else 'FAILED'}\n"
+            stub += "\nЧитайте файлы ролей напрямую — они полные и сохранены на диске.\n"
+            atomic_write(synth_path, stub)
+            print("synthesis: FALLBACK stub (см. synthesis.md)")
+    report = build_council_report(rid, task, results, synthesis, synth_ok)
+    atomic_write(os.path.join(out_dir, "report.md"), report)
+    total_tokens = 0
+    for _n, _m, _ok, meta in results:
+        u = meta.get("usage") or {}
+        total_tokens += (u.get("total_tokens") or 0)
+    atomic_write_json(os.path.join(out_dir, "council.json"),
+                      {"id": rid, "kind": "council31", "task": task,
+                       "roles": [{"name": n, "model": m, "ok": o}
+                                 for n, m, o, _mt in results],
+                       "synthesis_ok": synth_ok,
+                       "total_tokens": total_tokens,
+                       "workdir": out_dir, "finished_at": now_iso()})
+    print(f"report: {os.path.join(out_dir, 'report.md')}")
     print(f"dir: {out_dir}")
     return 0 if any(r[2] for r in results) else 1
 
@@ -669,6 +896,12 @@ def main():
     c = sub.add_parser("council")
     c.add_argument("--task", required=True)
     c.add_argument("--workers", type=int, default=MAX_PARALLEL)
+    c31 = sub.add_parser("council31")
+    c31.add_argument("--task")
+    c31.add_argument("--file")
+    c31.add_argument("--workdir")
+    c31.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    c31.add_argument("--dry-run", action="store_true")
     b = sub.add_parser("batch")
     b.add_argument("--file", required=True)
     b.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
@@ -686,6 +919,8 @@ def main():
         return cmd_run(args)
     if args.cmd == "council":
         return cmd_council(args)
+    if args.cmd == "council31":
+        return cmd_council31(args)
     if args.cmd == "batch":
         return cmd_batch(args)
     if args.cmd == "serve":
