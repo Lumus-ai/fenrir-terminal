@@ -9,9 +9,13 @@
 #   fenrir scheduler --once [--dry-run] [--tasks tasks.yaml] [--task-id ID]
 #   fenrir morning [--date YYYY-MM-DD] — утренний дайджест v1.4
 #   fenrir backup [--dry-run] [--no-upload] [--keep N] — бэкап на Drive v1.4
+#   fenrir funpay check [--inbox PATH] [--dry-run] — FunPay v2.2 шаг 1:
+#     только чтение и классификация, черновики в файл, отправки нет
+#   fenrir funpay status — сводка по магазину
 # Планировщик v1.4 — fenrir_scheduler.py (ядро: tasks.yaml + runner).
 # Утренний дайджест v1.4 — fenrir_digest.py.
 # Бэкап v1.4 — fenrir_backup.py (tar.gz + Google Drive).
+# FunPay v2.2 шаг 1 — fenrir_funpay.py (чтение + классификация, без отправки).
 # Утилиты (ram_guard, lix_countdown, health_summary, doctor, limits, usage) — fenrir_term.py.
 # Агент с циклом инструментов — fenrir_agent.py.
 set -u
@@ -79,6 +83,10 @@ case "${1:-status}" in
   backup)
     shift
     python3 "$TERM_DIR/fenrir_backup.py" "$@"
+    ;;
+  funpay)
+    shift
+    python3 "$TERM_DIR/fenrir_funpay.py" "$@"
     ;;
   down)
     pkill -f "fenrir_orchestra.py serv[e]" && echo "fenrir-orchestra остановлена" || echo "serve не работала"
