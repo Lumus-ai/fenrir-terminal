@@ -18,6 +18,10 @@
 #     простых текстовых заказов через агента (Lix), сдача — в очередь
 #   fenrir council --task "..." [--workdir DIR] [--file F] [--dry-run] — консилиум v3.1:
 #     кодер/ревьюер/тестер параллельно (макс 3 вызова), синтез + отчёт
+#   fenrir remote status|limits|tasks|digest|help|history|pending — пульт v3.2:
+#     команды чтения; stop|start|restart — только после /confirm <id>
+#   fenrir remote notify <готово|упало|алерт> <текст> [--dry-run]
+#   fenrir remote allow <user_id> | config | listen [--timeout N]
 #   fenrir router pick --role code|review|text [--refresh] — выбор живой модели Lix
 #   fenrir router status [--probe] — health, токены за день, бюджет, алерт
 #   fenrir router probe | fenrir router refresh — health-проба / живой прайс
@@ -110,6 +114,10 @@ case "${1:-status}" in
   council)
     shift
     python3 "$TERM_DIR/fenrir_council.py" "$@"
+    ;;
+  remote)
+    shift
+    python3 "$TERM_DIR/fenrir_remote.py" "$@"
     ;;
   down)
     pkill -f "fenrir_orchestra.py serv[e]" && echo "fenrir-orchestra остановлена" || echo "serve не работала"

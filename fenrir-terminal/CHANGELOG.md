@@ -1,5 +1,38 @@
 # Fenrir Terminal — Changelog
 
+## v3.2-шаг-1 (пульт с телефона: команды чтения + подтверждения + уведомления) — 07.11.2026
+
+- Пульт v3.2 шаг 1: `fenrir remote <команда>` (`fenrir-terminal/fenrir_remote.py`,
+  stdlib only). Команды чтения без подтверждения: status, limits, tasks,
+  digest, help, history, pending — живые данные терминала (serve /health,
+  RAM, отсчёт Lix, tasks.yaml, дайджест). Опасные: stop, start, restart —
+  только после двухшагового подтверждения: команда создаёт запрос с id,
+  действует 5 минут, затем авто-отклон; `confirm <id>` выполняет,
+  `reject <id>` отменяет. Whitelist user_id + rate limit 1 команда в 30
+  секунд (confirm/reject вне лимита). Журнал аудита logs/remote-audit.log.
+  Уведомления: одна строка `🐺 <готово|упало|алерт>: <текст>` через
+  коннектор custom.telegram-bot, только в настроенный chat_id; без chat_id
+  — dry-run. Polling-цикл `listen` (getUpdates) — требует настроенного
+  state/remote-config.json, иначе отказывается запускаться.
+- Бот за коннектором — @Postingmog_bot (id 8905015348), бот постинга канала
+  «Нейросигнал», НЕ отдельный бот-пульт. getUpdates пуст — Shadow боту в
+  личку не писал, chat_id неизвестен. Для живого пульта нужно от Shadow:
+  отдельный бот (BotFather → токен через защищённую форму) ИЛИ разрешение
+  использовать @Postingmog_bot + /start боту в личку, затем
+  `fenrir remote allow <user_id>`. В канал пульт не пишет никогда.
+  Вариант спеки (4111) «6-значный код на 2 минуты» не взят: id в
+  инлайн-кнопке удобнее. Команды /pause, /resume, /add, /logs, /diff,
+  /approve, /reject, /retry, /stats и inline-клавиатуры — не в шаге 1.
+- Проверки живьём 07.11.2026: `test_remote.py` — 23 проверки (парсер,
+  подтверждения, rate limit, whitelist, уведомления, аудит, listen);
+  остальные suites зелёные (scheduler 57, digest 23, worklog 33).
+  Живые прогоны: status/limits/tasks/digest — реальные данные;
+  stop → pending 9323c152, serve НЕ остановлен, затем reject — отменено;
+  notify — только --dry-run; listen — отказ без конфига. Путь отправки
+  проверен живым вызовом sendMessage на несуществующий chat_id 0 —
+  Telegram вернул 400, ничего никому не доставлено. `fenrir status`
+  по-прежнему v1.3.1, tasks.yaml не изменён, serve жив.
+
 ## v3.1 (консилиум внутри терминала) — 07.11.2026
 
 - Консилиум v3.1: команда `fenrir council --task "..." [--workdir DIR]
