@@ -41,6 +41,8 @@ import sys
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
+from fenrir_worklog import worklog
+
 try:
     from zoneinfo import ZoneInfo
     SAMARA = ZoneInfo("Europe/Samara")
@@ -302,6 +304,10 @@ def main(argv=None):
     text, out_path = generate(a.tasks, a.log, day, a.out_dir)
     print(text, end="")
     print(f"digest: записано в {out_path}")
+    # v1.4 авто-журлог: дайджест собран и записан (--no-write не
+    # логируется: файл не создан, работа не выполнена).
+    worklog("digest", "утренний дайджест", "ok",
+            f"записано в {os.path.basename(out_path)}")
     return 0
 
 

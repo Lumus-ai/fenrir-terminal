@@ -77,6 +77,8 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+from fenrir_worklog import worklog
+
 try:
     from zoneinfo import ZoneInfo
     SAMARA = ZoneInfo("Europe/Samara")
@@ -705,13 +707,16 @@ def _run_one(task, log):
     prompt = (f"Текущее время (Самара): "
               f"{_now().strftime('%Y-%m-%d %H:%M:%S %Z')}.\n"
               f"{task['task']}")
-    ok, used = run_task(prompt, workdir, kind, chain, max_steps, log)
+    # Агент свой лог в журлог не пишет (log_worklog=False): задачу
+    # логирует планировщик — одна строка на одно выполнение.
+    ok, used = run_task(prompt, workdir, kind, chain, max_steps, log,
+                        log_worklog=False)
     model = f"{used[0]}/{used[1]}" if used else None
     return ok, model
 
 
 def run_once(tasks_path=TASKS_PATH, dry_run=False, task_id=None,
-             window_min=DEFAULT_WINDOW_MIN):
+             window_min=DEFAULT_WINDOW_MIN, worklog_path=None):
     """Один проход планировщика. Возвращает dict с итогом."""
     result = {"ran": 0, "ok": 0, "failed": 0, "skipped": 0, "errors": []}
     data, errors = load_tasks(tasks_path)
@@ -773,6 +778,10 @@ def run_once(tasks_path=TASKS_PATH, dry_run=False, task_id=None,
                 result["failed"] += 1
             _log_line(f"scheduler: {tid} -> {t['status']} "
                       f"({t['last_result']})")
+            # v1.4 авто-журлог: одна строка на выполненную задачу.
+            worklog("scheduler", f"{tid} {t.get('title') or ''}",
+                    "ok" if ok else "failed", t["last_result"],
+                    path=worklog_path)
             save_tasks(data, tasks_path)
     finally:
         _release_lock(fd)

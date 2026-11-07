@@ -47,6 +47,7 @@ import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.request
 
 sys.path.insert(0, "/opt/muse/skills/custom-connector-setup/bin")
 from dynamic_credentials import add_surrogate_to_request, read_json_response
+from fenrir_worklog import worklog
 
 UA = "fenrir-agent/1.0"
 HOSTS = {
@@ -330,7 +331,7 @@ def chat(chain, messages, max_tokens=2000):
         print(f"fallback: {connector}/{model} недоступен, следующий в цепочке")
     raise last
 
-def run_task(task, workdir, kind, chain, max_steps, log):
+def _run_task(task, workdir, kind, chain, max_steps, log):
     workdir = os.path.expanduser(workdir)
     os.makedirs(workdir, exist_ok=True)
     messages = [{"role": "system", "content": SYSTEM},
@@ -421,6 +422,31 @@ def run_task(task, workdir, kind, chain, max_steps, log):
         log("detect_done: лимит шагов, но файлы на диске чистые — работа сделана")
         return True, used
     return False, used
+
+
+def _agent_title(task):
+    """Короткое название задачи для журлога (первая строка без
+    префикса текущего времени, который подставляет планировщик)."""
+    lines = [ln.strip() for ln in (task or "").splitlines() if ln.strip()]
+    if lines and lines[0].startswith("Текущее время (Самара):"):
+        lines = lines[1:]
+    return lines[0] if lines else "(без названия)"
+
+
+def run_task(task, workdir, kind, chain, max_steps, log, log_worklog=True):
+    """Выполнить задачу и написать строку в авто-журлог (v1.4).
+
+    log_worklog=False — для вызовов из планировщика: там задачу
+    логирует сам планировщик, иначе было бы две строки на одно
+    выполнение.
+    """
+    ok, used = _run_task(task, workdir, kind, chain, max_steps, log)
+    if log_worklog:
+        model = f"{used[0]}/{used[1]}" if used else "без модели"
+        worklog("agent", _agent_title(task), "ok" if ok else "failed",
+                model)
+    return ok, used
+
 
 def build_chain(kind, connector=None, model=None, provider=None):
     """Цепочка моделей для задачи.

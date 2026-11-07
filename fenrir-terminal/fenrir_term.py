@@ -27,6 +27,8 @@ import time
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
+from fenrir_worklog import worklog
+
 try:
     from zoneinfo import ZoneInfo
     SAMARA = ZoneInfo("Europe/Samara")
@@ -341,6 +343,11 @@ def ram_guard_check(dry_run=False, recheck_delay=5):
     if mb is None:
         log("CRITICAL: не читается /proc/meminfo")
         result["actions"].append("log")
+        # v1.4 авто-журлог: проверка не выполнилась (dry-run не
+        # логируется: ничего не сделано).
+        if not dry_run:
+            worklog("guard", "RAM guard", "failed",
+                    "не читается /proc/meminfo")
         return result
     status = _classify_ram(mb)
     result["status"] = status
@@ -366,6 +373,12 @@ def ram_guard_check(dry_run=False, recheck_delay=5):
                 f"освобождено ~{freed} байт")
         finally:
             _release_guard_lock(fd, lock_path)
+        # v1.4 авто-журлог: только когда что-то сделано (OK и dry-run
+        # не логируются).
+        if not dry_run:
+            worklog("guard", "RAM guard", "ok",
+                    f"WARN {mb} МБ, чистка: удалено {result['cleaned']}, "
+                    f"освобождено ~{result['freed_bytes']} байт")
         return result
     # CRITICAL — повторная проверка перед любым действием.
     log(f"CRITICAL: доступно {mb} МБ (< {RAM_CRIT_MB}) — "
@@ -381,6 +394,11 @@ def ram_guard_check(dry_run=False, recheck_delay=5):
         log(f"CRITICAL не подтвердился: {mb} -> {mb2} МБ [{status2}] — "
             f"чистка отменена (ложное срабатывание)")
         result["actions"].append("recheck-cancel")
+        # v1.4 авто-журлог: проверка была, чистки не было (dry-run не
+        # логируется).
+        if not dry_run:
+            worklog("guard", "RAM guard", "ok",
+                    f"CRIT {mb} МБ не подтвердился ({mb2} МБ), чистка отменена")
         return result
     log(f"CRITICAL подтверждён: {mb2} МБ — полная чистка")
     result["actions"].append("log")
@@ -409,6 +427,13 @@ def ram_guard_check(dry_run=False, recheck_delay=5):
             f"освобождено ~{freed} байт, ротировано логов: {rotated}")
     finally:
         _release_guard_lock(fd, lock_path)
+    # v1.4 авто-журлог: CRIT подтверждён, чистка выполнена (dry-run не
+    # логируется).
+    if not dry_run:
+        worklog("guard", "RAM guard", "ok",
+                f"CRIT {mb2} МБ, чистка: удалено {result['cleaned']}, "
+                f"освобождено ~{result['freed_bytes']} байт, "
+                f"ротировано логов: {result.get('rotated', 0)}")
     return result
 
 

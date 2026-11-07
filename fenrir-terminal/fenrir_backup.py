@@ -47,6 +47,8 @@ import tarfile
 import time
 from datetime import datetime, timedelta, timezone
 
+from fenrir_worklog import worklog
+
 TERM_DIR = os.path.dirname(os.path.abspath(__file__))
 WS = os.path.dirname(TERM_DIR)
 ORCH_DIR = os.path.join(WS, "fenrir-orchestra")
@@ -315,6 +317,9 @@ def cmd_backup(args):
         for arcname, what in hits:
             log("СЕКРЕТ: %s — %s" % (arcname, what))
         print("ОШИБКА: в составе найдены секреты — загрузка прервана.")
+        # v1.4 авто-журлог: бэкап не выполнен.
+        worklog("backup", "fenrir backup", "failed",
+                "в составе найдены секреты, загрузка прервана")
         return 1
     log("backup: секретов не найдено")
 
@@ -346,12 +351,22 @@ def cmd_backup(args):
         if back_digest != digest:
             log("ОШИБКА: sha256 скачанного архива не совпал!")
             print("ОШИБКА: проверка загрузки не прошла (sha256 не совпал).")
+            # v1.4 авто-журлог: бэкап не выполнен.
+            worklog("backup", "fenrir backup", "failed",
+                    "sha256 скачанного архива не совпал")
             return 1
         log("backup: проверка загрузки OK (sha256 совпал)")
         kept, dropped = rotate_drive(folder_id, ns.keep)
         log("backup: на Drive осталось %d архивов, в корзину %d"
             % (len(kept), len(dropped)))
     prune_local(KEEP_LOCAL)
+
+    # v1.4 авто-журлог: бэкап выполнен (dry-run не логируется: ничего
+    # не загружено и не сохранено).
+    if not ns.dry_run:
+        worklog("backup", "fenrir backup", "ok",
+                f"архив {os.path.basename(path)}, {size} байт"
+                + (f", Drive id {file_id}" if file_id else ", без загрузки"))
 
     print("Архив: %s" % path)
     print("Размер: %d байт" % size)
