@@ -54,7 +54,37 @@ CLI (через bin/fenrir):
 (тот же формат снимка), не трогая seen-состояние и WORK_LOG.
 --dry-run — только показать, что было бы сделано, ничего не писать.
 
-Запуск тестов: python3 test_funpay.py
+Запуск тестов: python3 test_funpay.py (шаг 1), test_funpay_queue.py (шаг 2)
+
+ШАГ 2 — очередь отправки + выполнение простых заказов:
+- Очередь `~/workspace/funpay-shop/outbox.json`: модуль переносит
+  готовые черновики в очередь со статусом queued (текст, message_id /
+  order_id, время создания). Фишинг и агрессия в очередь НЕ попадают
+  никогда — enqueue() отказывает по классу из файла черновика.
+  Отправку в браузер модуль НЕ делает: записи со статусом queued
+  отправляет браузерный вотч (крон funpay-watch-messages), он же
+  помечает их sent. Текст дополнения к задаче вотча — в файле
+  FUNPAY_WATCH_ADDENDUM.md рядом с модулем.
+- Выполнение простых заказов: заказ из inbox.json (kind=order,
+  статус paid) с текстом задания выполняется через fenrir_agent
+  (провайдер по умолчанию — Lix; Klinch только для планировщика,
+  не трогать) в workdir ~/workspace/funpay-shop/orders/<order-id>/.
+  Терминал выполняет ТОЛЬКО текстовые заказы (тексты, код, текст
+  песни, ответы ChatGPT): агент пишет файлы, изображений и аудио
+  он не генерирует, поэтому арт/озвучка/апскейл/инфографика/подкаст
+  помечаются needs_owner и не выполняются. Заказ без текста задания
+  в снимке — тоже needs_owner (ТЗ нет, выдумывать его нельзя).
+  Результат — файлы в orders/<id>/ + запись сдачи (kind=delivery)
+  в outbox; файлы к чату заказа прикладывает вотч.
+- Журнал: каждая постановка в очередь и каждое выполнение — строка
+  в WORK_LOG.md через fenrir_worklog + запись в logs/funpay-watch.log.
+- outbox.json и черновики с данными покупателей в GitHub НЕ пушатся.
+
+CLI (через bin/fenrir):
+  fenrir funpay queue [--outbox PATH]
+  fenrir funpay enqueue <draft-id>
+  fenrir funpay fulfill [--inbox PATH] [--order ID] [--dry-run]
+  fenrir funpay check ... [--enqueue] — черновики сразу в очередь
 """
 import hashlib
 import json
@@ -363,18 +393,23 @@ def write_draft(drafts_dir, msg_id, buyer, class_id, text):
 
 
 def check(inbox_path=None, seen_path=None, drafts_dir=None,
-          log_path=None, dry_run=False, now=None):
+          log_path=None, dry_run=False, now=None, enqueue_drafts=False,
+          outbox_path=None):
     """Одна проверка: живые лоты + снимок входящих.
 
     Возвращает dict-отчёт. Ничего не отправляет никуда.
+    enqueue_drafts=True — черновики, созданные в этой проверке,
+    сразу переносятся в очередь отправки (outbox.json).
     """
     inbox_path = inbox_path or default_inbox_path()
     seen_path = seen_path or default_seen_path()
     drafts_dir = drafts_dir or default_drafts_dir()
     log_path = log_path or default_log_path()
+    outbox_path = outbox_path or default_outbox_path()
     now = now or datetime.now(SAMARA)
     report = {"lots": [], "lots_new": [], "lots_gone": [],
               "messages_new": 0, "orders_new": 0, "drafts": [],
+              "queued": [],
               "escalate": [], "inbox": False, "error": None}
     seen = load_seen(seen_path)
 
@@ -426,6 +461,12 @@ def check(inbox_path=None, seen_path=None, drafts_dir=None,
                                        msg.get("buyer", "?"),
                                        result["class"], text)
                     report["drafts"].append(path)
+                    if enqueue_drafts:
+                        q = enqueue(mid or "noid", drafts_dir=drafts_dir,
+                                    outbox_path=outbox_path,
+                                    log_path=log_path, now=now)
+                        if q.get("ok"):
+                            report["queued"].append(q["entry"]["id"])
                 elif text:
                     report["drafts"].append(f"(dry-run) {mid}")
             if not dry_run and mid:
@@ -441,6 +482,12 @@ def check(inbox_path=None, seen_path=None, drafts_dir=None,
                 path = write_draft(drafts_dir, oid or "noid",
                                    order.get("buyer", "?"), "order", text)
                 report["drafts"].append(path)
+                if enqueue_drafts:
+                    q = enqueue(oid or "noid", drafts_dir=drafts_dir,
+                                outbox_path=outbox_path,
+                                log_path=log_path, now=now)
+                    if q.get("ok"):
+                        report["queued"].append(q["entry"]["id"])
             elif text:
                 report["drafts"].append(f"(dry-run) {oid}")
             if not dry_run and oid:
@@ -488,14 +535,326 @@ def status(inbox_path=None, seen_path=None):
     }
 
 
+# --- очередь отправки (outbox.json) — ШАГ 2 ---
+# Модуль ТОЛЬКО формирует очередь. Отправку в браузер делает вотч
+# (см. FUNPAY_WATCH_ADDENDUM.md). В коде нет отправки на FunPay.
+
+FORBIDDEN_ENQUEUE_CLASSES = ("phishing", "aggression", "system")
+
+
+def default_outbox_path():
+    return os.path.expanduser("~/workspace/funpay-shop/outbox.json")
+
+
+def default_orders_dir():
+    return os.path.expanduser("~/workspace/funpay-shop/orders")
+
+
+def load_outbox(path):
+    """Прочитать очередь отправки. Возвращает {"entries": [...]}."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"entries": []}
+    if not isinstance(data, dict) or not isinstance(
+            data.get("entries"), list):
+        return {"entries": []}
+    return data
+
+
+def save_outbox(path, outbox):
+    """Атомарно записать очередь отправки."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(outbox, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def parse_draft(path):
+    """Разобрать файл черновика (формат write_draft).
+
+    Возвращает {"id", "buyer", "class", "text"} или None.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None
+    lines = content.splitlines()
+    buyer = "?"
+    class_id = None
+    text = None
+    for i, line in enumerate(lines):
+        if line.startswith("# Черновик ответа"):
+            buyer = line.split("—", 1)[1].strip() if "—" in line else "?"
+        elif line.startswith("Класс:"):
+            class_id = line.split(":", 1)[1].strip().split()[0]
+        elif line.startswith("Статус:"):
+            # Текст — всё после пустой строки за строкой статуса.
+            rest = "\n".join(lines[i + 1:]).strip()
+            text = rest.lstrip("\n").strip()
+            break
+    if class_id is None or not text:
+        return None
+    draft_id = os.path.splitext(os.path.basename(path))[0]
+    return {"id": draft_id, "buyer": buyer, "class": class_id,
+            "text": text}
+
+
+def enqueue(draft_id, drafts_dir=None, outbox_path=None,
+            log_path=None, now=None):
+    """Перенести готовый черновик в очередь отправки.
+
+    Возвращает {"ok": bool, "entry": ..., "duplicate": bool,
+    "error": ...}. Фишинг, агрессия и системные — отказ всегда.
+    """
+    drafts_dir = drafts_dir or default_drafts_dir()
+    outbox_path = outbox_path or default_outbox_path()
+    log_path = log_path or default_log_path()
+    now = now or datetime.now(SAMARA)
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(draft_id))[:40]
+    parsed = parse_draft(os.path.join(drafts_dir, f"{safe_id}.md"))
+    if parsed is None:
+        return {"ok": False, "error": f"черновик {draft_id} не найден "
+                                       "или пуст"}
+    if parsed["class"] in FORBIDDEN_ENQUEUE_CLASSES:
+        return {"ok": False,
+                "error": f"класс {parsed['class']} не ставится в "
+                         "очередь (без ответа)"}
+    outbox = load_outbox(outbox_path)
+    for entry in outbox["entries"]:
+        if entry.get("id") == parsed["id"]:
+            return {"ok": True, "entry": entry, "duplicate": True}
+    entry = {
+        "id": parsed["id"],
+        "kind": "reply",
+        "message_id": None if parsed["class"] == "order" else parsed["id"],
+        "order_id": parsed["id"] if parsed["class"] == "order" else None,
+        "buyer": parsed["buyer"],
+        "class": parsed["class"],
+        "text": parsed["text"],
+        "files": [],
+        "status": "queued",
+        "created_at": now.strftime("%Y-%m-%dT%H:%M:%S+04:00"),
+        "sent_at": None,
+    }
+    outbox["entries"].append(entry)
+    save_outbox(outbox_path, outbox)
+    _log(log_path, f"enqueue: {entry['id']} ({entry['class']}) -> queued")
+    try:
+        from fenrir_worklog import worklog
+        worklog("funpay", f"FunPay: в очередь {entry['id']}", "ok",
+                f"класс {entry['class']}, покупатель {entry['buyer']}")
+    except Exception:  # noqa: BLE001 - журлог не роняет постановку
+        pass
+    return {"ok": True, "entry": entry, "duplicate": False}
+
+
+def queue_list(outbox_path=None):
+    """Список записей очереди отправки."""
+    outbox_path = outbox_path or default_outbox_path()
+    return load_outbox(outbox_path)["entries"]
+
+
+# --- выполнение простых заказов — ШАГ 2 ---
+
+def fulfill_kind(lot_name):
+    """Вид выполнения заказа по названию лота.
+
+    Возвращает (kind агента, описание) или None — заказ терминалом
+    не выполняется (нужны изображения/аудио/дизайн: агент пишет
+    только файлы, медиа не генерирует).
+    """
+    name = (lot_name or "").lower()
+    if "тексты на заказ" in name:
+        return ("text", "Тексты на заказ (рерайт, копирайт, переводы)")
+    if "помощь с кодом" in name:
+        return ("code", "Помощь с кодом / настройка Cursor")
+    if "текст песни" in name:
+        return ("text", "Текст песни + теги для Suno")
+    if "запросов в chatgpt" in name:
+        return ("text", "Выполнение запросов в ChatGPT (5 шт.)")
+    return None
+
+
+def _default_run_agent(kind, task, workdir, max_steps=15):
+    """Запустить агента терминала (провайдер по умолчанию — Lix)."""
+    from fenrir_agent import build_chain, run_task
+    chain = build_chain(kind, provider="lix")
+    lines = []
+
+    def log(s):
+        lines.append(s)
+
+    ok, used = run_task(task, workdir, kind, chain, max_steps, log,
+                        log_worklog=False)
+    model = f"{used[0]}/{used[1]}" if used else "без модели"
+    return ok, model, lines
+
+
+def _workdir_files(workdir):
+    if not os.path.isdir(workdir):
+        return []
+    return sorted(f for f in os.listdir(workdir)
+                  if os.path.isfile(os.path.join(workdir, f)))
+
+
+def fulfill(inbox_path=None, seen_path=None, outbox_path=None,
+            orders_dir=None, order_id=None, dry_run=False,
+            run_agent=None, log_path=None, now=None):
+    """Выполнить простые оплаченные заказы из снимка входящих.
+
+    run_agent — инъекция для тестов: run_agent(kind, task, workdir)
+    -> (ok, model, lines). По умолчанию — живой агент на Lix.
+    Возвращает dict-отчёт. Ничего не отправляет на FunPay: результат
+    кладётся на диск, в очередь — только запись сдачи.
+    """
+    inbox_path = inbox_path or default_inbox_path()
+    seen_path = seen_path or default_seen_path()
+    outbox_path = outbox_path or default_outbox_path()
+    orders_dir = orders_dir or default_orders_dir()
+    log_path = log_path or default_log_path()
+    now = now or datetime.now(SAMARA)
+    report = {"orders_total": 0, "fulfilled": [], "needs_owner": [],
+              "skipped": [], "error": None}
+    inbox = load_inbox(inbox_path)
+    if inbox is None:
+        report["error"] = "снимок входящих отсутствует"
+        return report
+    seen = load_seen(seen_path)
+    fulfilled = set(seen.get("fulfilled", []))
+    needs = seen.get("needs_owner", {})
+    if not isinstance(needs, dict):
+        needs = {}
+    outbox = load_outbox(outbox_path)
+    outbox_changed = False
+    for order in inbox.get("orders", []):
+        oid = str(order.get("id", ""))
+        if not oid:
+            continue
+        if order_id and oid != order_id:
+            continue
+        report["orders_total"] += 1
+        if oid in fulfilled:
+            report["skipped"].append((oid, "уже выполнен"))
+            continue
+        if oid in needs:
+            report["skipped"].append((oid, "needs_owner: " + needs[oid]))
+            continue
+        if order.get("status") != "paid":
+            report["skipped"].append(
+                (oid, f"статус {order.get('status')}: не оплачен"))
+            continue
+        buyer = order.get("buyer", "?")
+        lot_name, lot_term = match_lot_terms(order.get("lot", ""))
+        kind = fulfill_kind(lot_name)
+        if kind is None:
+            reason = ("лот не выполняется терминалом "
+                      "(нужны изображения/аудио/дизайн)")
+            needs[oid] = reason
+            report["needs_owner"].append((oid, reason))
+            _log(log_path, f"fulfill: {oid} needs_owner: {reason}")
+            continue
+        task_text = (order.get("task") or order.get("details")
+                     or order.get("text") or "").strip()
+        if not task_text:
+            reason = "нет текста задания от покупателя в снимке"
+            needs[oid] = reason
+            report["needs_owner"].append((oid, reason))
+            _log(log_path, f"fulfill: {oid} needs_owner: {reason}")
+            continue
+        if dry_run:
+            report["fulfilled"].append((oid, "(dry-run) " + kind[1]))
+            continue
+        safe_oid = re.sub(r"[^A-Za-z0-9_-]", "_", oid)[:40]
+        workdir = os.path.join(orders_dir, safe_oid)
+        os.makedirs(workdir, exist_ok=True)
+        agent_task = (
+            f"Выполни заказ FunPay {oid} для покупателя {buyer}.\n"
+            f"Лот: {kind[1]}. Срок выполнения — {lot_term}.\n"
+            f"Задание покупателя:\n{task_text}\n\n"
+            "Результат: запиши готовые файлы в рабочую папку "
+            "(только внутри неё, ничего не создавай снаружи). "
+            "Пиши по-русски, без воды, точно по заданию.")
+        runner = run_agent or _default_run_agent
+        try:
+            ok, model, _lines = runner(kind[0], agent_task, workdir)
+        except Exception as e:  # noqa: BLE001 - падение агента
+            ok, model = False, f"ошибка агента: {e}"
+        files = _workdir_files(workdir)
+        if ok and files:
+            delivery_id = f"delivery-{oid}"
+            if not any(e.get("id") == delivery_id
+                       for e in outbox["entries"]):
+                entry = {
+                    "id": delivery_id,
+                    "kind": "delivery",
+                    "message_id": None,
+                    "order_id": oid,
+                    "buyer": buyer,
+                    "class": "order",
+                    "text": ("Здравствуйте! Ваш заказ выполнен — "
+                             "результат прикреплён к сообщению "
+                             f"({', '.join(files)}). Если нужны правки — "
+                             "напишите в чат заказа."),
+                    "files": [os.path.join(workdir, f) for f in files],
+                    "status": "queued",
+                    "created_at": now.strftime("%Y-%m-%dT%H:%M:%S+04:00"),
+                    "sent_at": None,
+                }
+                outbox["entries"].append(entry)
+                outbox_changed = True
+            fulfilled.add(oid)
+            report["fulfilled"].append((oid, f"{kind[1]}, {model}"))
+            _log(log_path,
+                 f"fulfill: {oid} OK ({model}), файлов {len(files)}, "
+                 "сдача в очереди")
+            try:
+                from fenrir_worklog import worklog
+                worklog("funpay", f"FunPay: заказ {oid} выполнен", "ok",
+                        f"{kind[1]}, {model}, файлов {len(files)}")
+            except Exception:  # noqa: BLE001 - журлог не роняет выполнение
+                pass
+        else:
+            reason = ("агент не выполнил заказ"
+                      + (" (файлов нет)" if ok else f" ({model})"))
+            needs[oid] = reason
+            report["needs_owner"].append((oid, reason))
+            _log(log_path, f"fulfill: {oid} needs_owner: {reason}")
+            try:
+                from fenrir_worklog import worklog
+                worklog("funpay", f"FunPay: заказ {oid} не выполнен",
+                        "failed", reason)
+            except Exception:  # noqa: BLE001 - журлог не роняет выполнение
+                pass
+    seen["fulfilled"] = sorted(fulfilled)
+    seen["needs_owner"] = needs
+    if not dry_run:
+        save_seen(seen_path, seen)
+        if outbox_changed:
+            save_outbox(outbox_path, outbox)
+    return report
+
+
 def main(argv):
-    if not argv or argv[0] not in ("check", "status"):
+    if not argv or argv[0] not in ("check", "status", "queue",
+                                   "enqueue", "fulfill"):
         print("Использование: fenrir funpay check [--inbox PATH] "
-              "[--file PATH] [--dry-run] | fenrir funpay status")
+              "[--file PATH] [--dry-run] [--enqueue] | fenrir funpay "
+              "status | fenrir funpay queue [--outbox PATH] | fenrir "
+              "funpay enqueue <draft-id> | fenrir funpay fulfill "
+              "[--inbox PATH] [--order ID] [--dry-run]")
         return 2
     cmd = argv[0]
     inbox = None
+    outbox = None
+    order_id = None
     dry_run = False
+    enqueue_flag = False
     i = 1
     while i < len(argv):
         if argv[i] == "--inbox" and i + 1 < len(argv):
@@ -504,12 +863,73 @@ def main(argv):
         elif argv[i] == "--file" and i + 1 < len(argv):
             inbox = argv[i + 1]
             i += 2
+        elif argv[i] == "--outbox" and i + 1 < len(argv):
+            outbox = argv[i + 1]
+            i += 2
+        elif argv[i] == "--order" and i + 1 < len(argv):
+            order_id = argv[i + 1]
+            i += 2
         elif argv[i] == "--dry-run":
             dry_run = True
             i += 1
-        else:
+        elif argv[i] == "--enqueue":
+            enqueue_flag = True
+            i += 1
+        elif argv[i].startswith("--"):
             print(f"неизвестный аргумент: {argv[i]}")
             return 2
+        else:
+            # Позиционный аргумент: draft-id для enqueue.
+            if cmd == "enqueue" and order_id is None:
+                order_id = argv[i]
+                i += 1
+            else:
+                print(f"неизвестный аргумент: {argv[i]}")
+                return 2
+    if cmd == "queue":
+        entries = queue_list(outbox_path=outbox)
+        queued = [e for e in entries if e.get("status") == "queued"]
+        sent = [e for e in entries if e.get("status") == "sent"]
+        print(f"FunPay {SHOP_NICK}: очередь отправки — "
+              f"всего {len(entries)}, в очереди {len(queued)}, "
+              f"отправлено {len(sent)}")
+        for e in entries:
+            files = (f", файлы: {', '.join(e['files'])}"
+                     if e.get("files") else "")
+            print(f"  [{e.get('status')}] {e.get('id')} "
+                  f"({e.get('kind')}, {e.get('class')}) — "
+                  f"{e.get('buyer')}, создано {e.get('created_at')}"
+                  f"{files}")
+        return 0
+    if cmd == "enqueue":
+        if not order_id:
+            print("Использование: fenrir funpay enqueue <draft-id>")
+            return 2
+        res = enqueue(order_id)
+        if res["ok"]:
+            print(f"В очереди: {res['entry']['id']} "
+                  f"({res['entry']['class']})"
+                  + (" (уже был в очереди)" if res.get("duplicate")
+                     else ""))
+            return 0
+        print(f"ОШИБКА: {res['error']}")
+        return 1
+    if cmd == "fulfill":
+        rep = fulfill(inbox_path=inbox, order_id=order_id,
+                      dry_run=dry_run)
+        if rep["error"]:
+            print(f"ОШИБКА: {rep['error']}")
+            return 1
+        print(f"Заказов в снимке: {rep['orders_total']}")
+        for oid, note in rep["fulfilled"]:
+            print(f"  Выполнен: {oid} — {note}")
+        for oid, reason in rep["needs_owner"]:
+            print(f"  Нужен владелец: {oid} — {reason}")
+        for oid, note in rep["skipped"]:
+            print(f"  Пропущен: {oid} — {note}")
+        if not rep["fulfilled"] and not rep["needs_owner"]:
+            print("Выполнять нечего.")
+        return 0
     if cmd == "status":
         st = status(inbox_path=inbox)
         print(f"FunPay {SHOP_NICK} (id {SHOP_ID})")
@@ -521,7 +941,8 @@ def main(argv):
               f"заказов: {st['seen_orders']}")
         print(f"Последняя проверка: {st['last_check'] or 'не было'}")
         return 0
-    rep = check(inbox_path=inbox, dry_run=dry_run)
+    rep = check(inbox_path=inbox, dry_run=dry_run,
+                enqueue_drafts=enqueue_flag)
     print(f"FunPay {SHOP_NICK}: лотов на странице {len(rep['lots'])}")
     if rep.get("lots_note"):
         print(f"Лоты: {rep['lots_note']} ({len(rep['lots_new'])} шт.)")
@@ -541,6 +962,8 @@ def main(argv):
               f"{rep['messages_new']}, новых заказов {rep['orders_new']}")
         for path in rep["drafts"]:
             print(f"Черновик: {path}")
+        for qid in rep.get("queued", []):
+            print(f"В очереди: {qid}")
         for esc in rep["escalate"]:
             print(f"ЭСКАЛАЦИЯ: {esc['buyer']} — {esc['class']} "
                   f"(без ответа, блокировка + жалоба)")
