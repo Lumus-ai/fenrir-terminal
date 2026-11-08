@@ -30,7 +30,9 @@
 - Вчера выполнено считается по строкам лога
   «scheduler: <id> -> done» за вчера; задачи done без last_run
   (например, помеченные вручную через `fen task done`) в счёт
-  вчера не попадают — у них нет даты выполнения.
+  вчера не попадают — у них нет даты выполнения. Строки про
+  тестовые задачи (id TST-*) не считаются вообще — ни в done,
+  ни в окно активности, ни в «последнюю активность».
 - Если tasks.yaml битый или отсутствует — дайджест не падает:
   раздел задач показывает ошибку валидации, остальные разделы
   считаются как обычно.
@@ -59,6 +61,8 @@ WEEKDAYS_RU = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 LOG_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\s+(.*)$")
 LOG_DONE_RE = re.compile(r"scheduler: (\S+) -> done\b")
 LOG_FAILED_RE = re.compile(r"scheduler: (\S+) -> failed\b")
+# Тестовые задачи планировщика (id TST-*, прогоны из scheduler-test/).
+TEST_ID_RE = re.compile(r"\bTST-\S+")
 
 
 def _parse_dt(value):
@@ -163,6 +167,11 @@ def collect_stats(tasks_path=TASKS_PATH, log_path=SCHEDULER_LOG, day=None):
         line_date = date.fromisoformat(m.group(1))
         line_time = m.group(2)
         body = m.group(3)
+        # Тестовые прогоны (TST-*) — не реальная работа: не попадают
+        # ни в счётчики, ни в окно активности, ни в «последнюю
+        # активность» (08.11 дайджест замусорили 54 строки TST-900).
+        if TEST_ID_RE.search(body):
+            continue
         last_line = (line_date, line_time, body)
         if line_date != yesterday:
             continue

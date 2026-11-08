@@ -17,7 +17,7 @@ import fenrir_digest as dg
 TASKS_YAML = """version: "1.4"
 updated: 2026-11-07T10:00:00+04:00
 tasks:
-  - id: TST-OVER1
+  - id: WRK-OVER1
     title: "Просроченная раз"
     task: "Сделай раз."
     workdir: "~/workspace/fenrir-terminal/scheduler-tasks/t1"
@@ -28,7 +28,7 @@ tasks:
     due: 2026-11-05T10:00:00+04:00
     priority: P1
     created: 2026-11-05T09:00:00+04:00
-  - id: TST-OVER2
+  - id: WRK-OVER2
     title: "Просроченная два"
     task: "Сделай два."
     workdir: "~/workspace/fenrir-terminal/scheduler-tasks/t2"
@@ -39,7 +39,7 @@ tasks:
     due: 2026-11-06T10:00:00+04:00
     priority: P2
     created: 2026-11-06T09:00:00+04:00
-  - id: TST-TODAY
+  - id: WRK-TODAY
     title: "На сегодня"
     task: "Сделай сегодня."
     workdir: "~/workspace/fenrir-terminal/scheduler-tasks/t3"
@@ -50,7 +50,7 @@ tasks:
     due: 2026-11-07T18:00:00+04:00
     priority: P2
     created: 2026-11-07T09:00:00+04:00
-  - id: TST-P0
+  - id: WRK-P0
     title: "Критичная"
     task: "Сделай срочно."
     workdir: "~/workspace/fenrir-terminal/scheduler-tasks/t4"
@@ -60,7 +60,7 @@ tasks:
     schedule: manual
     priority: P0
     created: 2026-11-07T09:00:00+04:00
-  - id: TST-DONEY
+  - id: WRK-DONEY
     title: "Выполненная вчера"
     task: "Была выполнена."
     workdir: "~/workspace/fenrir-terminal/scheduler-tasks/t5"
@@ -74,9 +74,11 @@ tasks:
     last_result: "ok"
 """
 
-LOG_TEXT = """2026-11-06 09:15:00   scheduler: TST-DONEY -> done (ok (custom.klinch/gpt-6-luna))
-2026-11-06 12:30:00   scheduler: TST-OTHER -> failed (error)
-2026-11-07 08:00:00   scheduler: TST-TODAY -> done (ok)
+LOG_TEXT = """2026-11-06 09:15:00   scheduler: WRK-DONEY -> done (ok (custom.klinch/gpt-6-luna))
+2026-11-06 12:30:00   scheduler: WRK-OTHER -> failed (error)
+2026-11-06 13:00:00   scheduler: TST-GHOST -> done (ok)
+2026-11-06 13:05:00   scheduler: задача TST-900 не todo (статус done) — пропуск
+2026-11-07 08:00:00   scheduler: WRK-TODAY -> done (ok)
 """
 
 DAY = date(2026, 11, 7)
@@ -111,17 +113,24 @@ def run():
               f"got {len(st['overdue'])}")
         check("сегодня = 1", len(st["due_today"]) == 1)
         check("P0 = 1", len(st["p0"]) == 1)
-        check("вчера done по логу = 1 (TST-DONEY)",
-              st["done_yday"] == ["TST-DONEY"], f"got {st['done_yday']}")
-        check("вчера failed по логу = 1 (TST-OTHER)",
-              st["failed_yday"] == ["TST-OTHER"])
+        check("вчера done по логу = 1 (WRK-DONEY)",
+              st["done_yday"] == ["WRK-DONEY"], f"got {st['done_yday']}")
+        check("вчера failed по логу = 1 (WRK-OTHER)",
+              st["failed_yday"] == ["WRK-OTHER"])
+        check("тестовые TST-* в done вчера не попадают",
+              "TST-GHOST" not in st["done_yday"]
+              and "TST-900" not in st["done_yday"],
+              f"got {st['done_yday']}")
+        check("тестовые TST-* не сдвигают окно активности",
+              st["yday_first"] == "09:15:00" and st["yday_last"] == "12:30:00",
+              f"got {st['yday_first']}–{st['yday_last']}")
         check("окно активности вчера 09:15–12:30",
               st["yday_first"] == "09:15:00" and st["yday_last"] == "12:30:00",
               f"got {st['yday_first']}–{st['yday_last']}")
         check("todo всего = 4", st["total_todo"] == 4)
         check("нет ошибки валидации", st["tasks_error"] is None)
         check("заголовок done вчера по tasks.yaml",
-              st["done_titles"].get("TST-DONEY") == "Выполненная вчера")
+              st["done_titles"].get("WRK-DONEY") == "Выполненная вчера")
 
         text = dg.render_digest(st)
         check("заголовок даты 07.11 (сб)",
@@ -133,8 +142,10 @@ def run():
         check("нет выдуманных часов активности",
               "6ч" not in text and "активность 6" not in text)
         check("раздел просроченных содержит оба id",
-              "TST-OVER1" in text and "TST-OVER2" in text)
-        check("раздел P0 содержит TST-P0", "TST-P0" in text)
+              "WRK-OVER1" in text and "WRK-OVER2" in text)
+        check("раздел P0 содержит WRK-P0", "WRK-P0" in text)
+        check("в тексте дайджеста нет тестовых TST-*",
+              "TST-GHOST" not in text and "TST-900" not in text)
 
         # Генерация файла + идемпотентность.
         text1, path1 = dg.generate(tasks, log, DAY, out_dir)
